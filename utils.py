@@ -730,6 +730,19 @@ def extract_centered_cube(input_volume, cube_size=32):
     cube[:x2-x1, :y2-y1, :z2-z1] = input_volume[x1:x2, y1:y2, z1:z2]
     
     return cube
+
+
+def linear_soft_dice(a, b, foreground_weight=0.8, background_weight=0.2):
+    # Calculate Soft Dice for foreground
+    foreground_dice = soft_dice(a * b, b)
+    
+    # Calculate Soft Dice for background
+    background_dice = soft_dice((1 - a) * (1 - b), 1 - b)
+    
+    # Linear combination of foreground and background Soft Dice coefficients
+    total_dice = foreground_weight * foreground_dice + background_weight * background_dice
+    
+    return total_dice
     
 class EarlyStoppingByLossVal(Callback):
     def __init__(self, monitor='loss', value=1e-4, verbose=0):
@@ -771,7 +784,7 @@ def load_val(validation_folder_path):
     b3_images=[]
     b2_masks=[]
     b3_masks=[]
-
+    mom_ids = []
     subfolders = [f.name for f in os.scandir(validation_folder_path) if f.is_dir()]
     
     for folder in subfolders:
@@ -807,9 +820,10 @@ def load_val(validation_folder_path):
             b3_masks.append(mask)
         latest_images.append(crop_img)
         latest_masks.append(mask)
+        mom_ids.append(mom)
             
 
-    return latest_images, latest_masks , b2_images, b3_images, b2_masks, b3_masks
+    return mom_ids, latest_images, latest_masks , b2_images, b3_images, b2_masks, b3_masks
 
 def find_largest_component(mask):
     labeled_mask, num_features = ndi.label(mask)
@@ -822,3 +836,173 @@ def find_largest_component(mask):
             largest_component = (labeled_mask == region.label)
 
     return largest_component if largest_component is not None else np.zeros_like(mask)
+
+
+def dice_coefficient(y_true, y_pred):
+    intersection = np.sum(y_true * y_pred)
+    union = np.sum(y_true) + np.sum(y_pred)
+    return (2.0 * intersection) / (union) 
+
+def my_hard_dice(y_true, y_pred):
+    y_true_flat = y_true.flatten()
+    y_pred_flat = y_pred.flatten()
+    dice = dice_coefficient(y_true_flat, y_pred_flat)
+    return dice
+    
+def calculate_hard_dice(image, model, mask):
+    prediction_one_hot = model.predict(image.data[None,...,None], verbose=0)
+    predictions_argmax = np.argmax(prediction_one_hot, axis=-1)
+    prediction = np.squeeze(predictions_argmax, axis=0)
+    mask.data[mask.data != 0] = 1
+    prediction = ndimage.binary_fill_holes(prediction).astype(int)
+    return my_hard_dice(prediction.flatten(),mask.data.flatten())
+
+def is_centered_3d(prediction, margins=(8, 8, 8)):
+    # Sum projections along each axis
+    summed_projection_axis0 = np.sum(prediction, axis=(1, 2))
+    summed_projection_axis1 = np.sum(prediction, axis=(0, 2))
+    summed_projection_axis2 = np.sum(prediction, axis=(0, 1))
+    
+    # Get non-zero coordinates for each axis
+    non_zero_coords_axis0 = np.argwhere(summed_projection_axis0)
+    non_zero_coords_axis1 = np.argwhere(summed_projection_axis1)
+    non_zero_coords_axis2 = np.argwhere(summed_projection_axis2)
+    
+    # Get min and max coordinates for each axis
+    min_coords_axis0 = np.min(non_zero_coords_axis0, axis=0)
+    max_coords_axis0 = np.max(non_zero_coords_axis0, axis=0)
+    
+    min_coords_axis1 = np.min(non_zero_coords_axis1, axis=0)
+    max_coords_axis1 = np.max(non_zero_coords_axis1, axis=0)
+    
+    min_coords_axis2 = np.min(non_zero_coords_axis2, axis=0)
+    max_coords_axis2 = np.max(non_zero_coords_axis2, axis=0)
+    
+    # Check if non-zero elements have margins in all axes
+    axis0_centered = (min_coords_axis0 >= margins[0]) and (summed_projection_axis0.shape[0] - max_coords_axis0 - 1 >= margins[0])
+    axis1_centered = (min_coords_axis1 >= margins[1]) and (summed_projection_axis1.shape[0] - max_coords_axis1 - 1 >= margins[1])
+    axis2_centered = (min_coords_axis2 >= margins[2]) and (summed_projection_axis2.shape[0] - max_coords_axis2 - 1 >= margins[2])
+    
+    return axis0_centered and axis1_centered and axis2_centered
+
+def get_final_combined_mask(masks):
+    """
+    Return the final combined mask from a list of 3D masks.
+
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+
+    Returns:
+    np.ndarray: Final combined 3D mask.
+    """
+    if not masks:
+        raise ValueError("The list of masks is empty.")
+
+    final_mask = masks[-1]
+    return final_mask.astype(int)
+
+def get_last_two_masks(masks):
+    """
+    Return the last two masks from a list of 3D masks.
+
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+
+    Returns:
+    tuple of np.ndarray: The last two 3D masks.
+    """
+    if len(masks) < 2:
+        raise ValueError("The list of masks must contain at least two masks.")
+    
+    return [masks[-2], masks[-1]]
+    
+def get_first_combined_mask(masks):
+    """
+    Return the final combined mask from a list of 3D masks.
+
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+
+    Returns:
+    np.ndarray: Final combined 3D mask.
+    """
+    if not masks:
+        raise ValueError("The list of masks is empty.")
+
+    final_mask = masks[0]
+    return final_mask.astype(int)
+    
+
+def combine_masks_weighted_average_descending(masks, weights):
+    """
+    Combine multiple 3D masks using weighted averaging with descending weights.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D probability masks.
+    weights (list of float): List of weights for each mask.
+    
+    Returns:
+    np.ndarray: Combined 3D mask.
+    """
+    descending_weights = sorted(weights, reverse=True)
+    weighted_masks = [mask * weight for mask, weight in zip(masks, descending_weights)]
+    combined_mask = np.sum(weighted_masks, axis=0) / np.sum(descending_weights)
+    return (combined_mask > 0.5).astype(int)
+
+
+def combine_masks_weighted_average_ascending(masks, weights):
+    """
+    Combine multiple 3D masks using weighted averaging with ascending weights.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D probability masks.
+    weights (list of float): List of weights for each mask.
+    
+    Returns:
+    np.ndarray: Combined 3D mask.
+    """
+    ascending_weights = sorted(weights)
+    weighted_masks = [mask * weight for mask, weight in zip(masks, ascending_weights)]
+    combined_mask = np.sum(weighted_masks, axis=0) / np.sum(ascending_weights)
+    return (combined_mask > 0.5).astype(int)
+
+
+def combine_masks_intersection(masks):
+    """
+    Combine multiple 3D masks using intersection.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+    
+    Returns:
+    np.ndarray: Combined 3D mask.
+    """
+    combined_mask = np.logical_and.reduce(masks)
+    return combined_mask.astype(int)
+
+def combine_masks_union(masks):
+    """
+    Combine multiple 3D masks using union.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+    
+    Returns:
+    np.ndarray: Combined 3D mask.
+    """
+    combined_mask = np.logical_or.reduce(masks)
+    return combined_mask.astype(int)
+    
+def combine_masks_majority_voting(masks):
+    """
+    Combine multiple 3D masks using majority voting.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+    
+    Returns:
+    np.ndarray: Combined 3D mask.
+    """
+    masks_stack = np.stack(masks, axis=-1)
+    combined_mask = np.sum(masks_stack, axis=-1) > (len(masks) / 2)
+    return combined_mask.astype(int)

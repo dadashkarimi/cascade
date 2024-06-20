@@ -275,8 +275,8 @@ if __name__ == "__main__":
     if args.model=='6Net':
         model_feta_config = config["feta_6"]
 
-        brain_maps = [np.uint8(sf.load_volume(str(file_path)).resize(1.2).reshape([param_3d.img_size_6,]*3).data) for file_path in feta_files]
-        brain_maps = [ndimage.gaussian_filter(img, sigma=(3, 3, 3), order=0) for img in brain_maps]
+        brain_maps = [np.uint8(sf.load_volume(str(file_path)).resize(1.8).reshape([param_3d.img_size_6,]*3).data) for file_path in feta_files]
+        # brain_maps = [ndimage.gaussian_filter(img, sigma=(3, 3, 3), order=0) for img in brain_maps]
 
         en = [16 ,16 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64]
         de = [64 ,64 ,64 ,64, 64 ,64 ,64, 64, 64, 16 ,16 ,2]
@@ -301,7 +301,7 @@ if __name__ == "__main__":
 
         _, fg = model_feta(input_img)
         
-        shapes = draw_shapessba(shape = (param_3d.img_size_6,)*3)
+        shapes = draw_shapes(shape = (param_3d.img_size_6,)*3)
         
         shapes = tf.squeeze(shapes)
         shapes = tf.cast(shapes, tf.uint8)
@@ -322,7 +322,7 @@ if __name__ == "__main__":
         segmentation = unet_model(generated_img_norm)
         combined_model = Model(inputs=input_img, outputs=segmentation)
         combined_model.add_loss(soft_dice(y, segmentation))
-        combined_model.compile(optimizer=Adam(learning_rate=param_3d.lr))
+        combined_model.compile(optimizer=Adam(learning_rate=param_3d.small_lr))
         
         brain_maps = [tf.cast(brain, tf.uint8) for brain in brain_maps]
 
@@ -331,7 +331,7 @@ if __name__ == "__main__":
         model_feta_config = config["feta_12"]
 
         # brain_maps = [np.uint8(sf.load_volume(str(file_path)).reshape([param_3d.img_size_12,]*3).data) for file_path in feta_files]
-        brain_maps = [np.uint8(sf.load_volume(str(file_path)).resize(1.5).reshape([param_3d.img_size_12,]*3).data) for file_path in feta_files]
+        brain_maps = [np.uint8(sf.load_volume(str(file_path)).resize(1.8).reshape([param_3d.img_size_12,]*3).data) for file_path in feta_files]
 
         en = [16 ,16 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64]
         de = [64 ,64 ,64 ,64, 64 ,64 ,64, 64, 64, 16 ,16 ,2]
@@ -356,7 +356,7 @@ if __name__ == "__main__":
 
         _, fg = model_feta(input_img)
         
-        shapes = draw_shapes(shape = (param_3d.img_size_12,)*3)
+        shapes = draw_shapes_easy(shape = (param_3d.img_size_12,)*3)
         
         shapes = tf.squeeze(shapes)
         shapes = tf.cast(shapes, tf.uint8)
@@ -364,9 +364,6 @@ if __name__ == "__main__":
         _, bg = model_shapes(shapes[None,...,None])
         bg = shift_non_zero_elements(bg,8)    
         result = fg + bg * tf.cast(fg == 0,tf.int32)
-
-        # result = random_selection_layer(bg,result,maxval=150)
-
         
         generated_img , y = labels_to_image_model(result)
 
@@ -376,7 +373,7 @@ if __name__ == "__main__":
         segmentation = unet_model(generated_img_norm)
         combined_model = Model(inputs=input_img, outputs=segmentation)
         combined_model.add_loss(soft_dice(y, segmentation))
-        combined_model.compile(optimizer=Adam(learning_rate=param_3d.lr))
+        combined_model.compile(optimizer=Adam(learning_rate=param_3d.small_lr))
         
         # brain_maps = feta_label_maps
         brain_maps = [tf.cast(brain, tf.uint8) for brain in brain_maps]
@@ -386,10 +383,9 @@ if __name__ == "__main__":
     elif args.model=='24Net':
         brain_maps = [np.uint8(sf.load_volume(str(file_path)).resize(1.5).reshape([param_3d.img_size_24,]*3).data) for file_path in feta_files]
 
-        # en = [32, 64, 64, 128, 128, 256, 512]  # Example encoder feature sizes
-        # de = [512, 256, 128, 128, 64, 64, 32, 2]  # Example decoder feature sizes
-        en = [32 ,32 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64]
-        de = [64 ,64 ,64 ,64, 64 ,64 ,64, 64, 64, 32 ,32 ,2]
+        en = [16 ,16 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64]
+        de = [64 ,64 ,64 ,64, 64 ,64 ,64, 64, 64, 16 ,16 ,2]
+        
         model_feta_config = config["feta_24"]
         model3_config = config["labels_to_image_model_24"]
         model3_config["labels_out"] = {int(key): value for key, value in model3_config["labels_out"].items()}
@@ -408,7 +404,7 @@ if __name__ == "__main__":
         input_img = Input(shape=(param_3d.img_size_24,param_3d.img_size_24,param_3d.img_size_24,1))
 
         _, fg = model_feta(input_img)
-        shapes = draw_shapes(shape = (param_3d.img_size_24,)*3,warp_min=12)
+        shapes = draw_shapes_easy(shape = (param_3d.img_size_24,)*3,warp_min=12)
         
         shapes = tf.squeeze(shapes)
         shapes = tf.cast(shapes, tf.uint8)
@@ -416,9 +412,6 @@ if __name__ == "__main__":
         _, bg = model_shapes(shapes[None,...,None])
         bg = shift_non_zero_elements(bg,8)    
         result = fg + bg * tf.cast(fg == 0,tf.int32)
-
-        # result = random_selection_layer(bg,result,maxval=40)
-
         
         generated_img , y = labels_to_image_model(result)
         
@@ -429,7 +422,7 @@ if __name__ == "__main__":
         segmentation = unet_model(generated_img_norm)
         combined_model = Model(inputs=input_img, outputs=segmentation)
         combined_model.add_loss(soft_dice(y, segmentation))
-        combined_model.compile(optimizer=Adam(learning_rate=param_3d.lr))
+        combined_model.compile(optimizer=Adam(learning_rate=param_3d.small_lr))
         
         # brain_maps = feta_label_maps
         brain_maps = [tf.cast(brain, tf.uint8) for brain in brain_maps]

@@ -28,6 +28,8 @@ dim_48 = img_size_48 * img_size_48 * img_size_48 * input_channel
 b_init = 0.0
 w_std = 0.1
 lr = 0.00001
+small_lr = 0.000001
+
 epoch_num = 4000
 pos_batch_12net = 16
 neg_batch = 96
