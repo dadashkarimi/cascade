@@ -1,4 +1,4 @@
-# Fetal Brain Segmentation with Cascade UNet
+# Deep Focused Sliding Windows for Fetus Brain Localization
 
 ## Overview
 
