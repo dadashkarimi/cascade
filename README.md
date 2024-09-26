@@ -47,7 +47,9 @@ pip install -r requirements.txt
 ## Usage
 Preprocess the data: Run the preprocessing script to reshape and downsample images.
 
+```bash
 python preprocess.py --input /path/to/data --output /path/to/preprocessed
+```
 
 ## Train the model
 
