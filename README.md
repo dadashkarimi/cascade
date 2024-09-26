@@ -42,6 +42,7 @@ To set up the environment and install the required dependencies:
 git clone https://github.com/yourusername/fetal-brain-segmentation.git
 cd fetal-brain-segmentation
 pip install -r requirements.txt
+```
 
 ## Usage
 Preprocess the data: Run the preprocessing script to reshape and downsample images.
@@ -54,13 +55,15 @@ Start training the cascade model using the preprocessed data.
 
 ```bash
 python train.py --data /path/to/preprocessed --output /path/to/models
+```
+
 ## Test the model
 
 
 Evaluate the model on test images.
-
+```bash
 python test.py --model /path/to/models --data /path/to/testdata
-
+```
 
 ## Results
 Our method demonstrates superior segmentation performance, particularly for younger fetuses, when compared to baseline methods such as:
@@ -73,7 +76,7 @@ We achieve higher Dice scores on clinical datasets, demonstrating the model's ro
 ## Citation
 If you use this code or model in your research, please cite:
 
-
+```
 @article{yourpaper2024,
   title={Revisiting Sliding Window Approach: Cascade UNets for Fetus Brain Segmentation When No Training Data Is Available},
   author={Your Name et al.},
@@ -81,6 +84,7 @@ If you use this code or model in your research, please cite:
   year={2024},
   publisher={Your Publisher}
 }
+```
 
 ## License
 This project is licensed under the MIT License. See the LICENSE file for more details.
