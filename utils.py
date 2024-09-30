@@ -28,10 +28,14 @@ import param_3d
 import model_3d
 from tensorflow.keras.callbacks import Callback
 from utils import *
-
+from skimage.measure import label
 
 import scipy.ndimage as ndi
 from skimage.measure import regionprops, marching_cubes
+import numpy as np
+from scipy.optimize import least_squares
+from scipy.linalg import svd
+import scipy.ndimage
 
 def img2array(img,dim):
      
@@ -211,37 +215,332 @@ def load_validation_data(validation_folder_path,dim_):
         image_mask_pairs.append((crop_data,mask.data))
     return image_mask_pairs
 
+def load_validation_data_one_hot(validation_folder_path,dim_):
+    subfolders = [f.name for f in os.scandir(validation_folder_path) if f.is_dir()]
+    image_mask_pairs = []
 
+    for folder in subfolders:
+        folder_path = os.path.join(validation_folder_path, folder)
+        filename = os.path.join(folder_path, "image.nii.gz") if os.path.exists(os.path.join(folder_path, "image.nii.gz")) else os.path.join(folder_path, "image.mgz")
+        mask_filename = os.path.join(folder_path,"manual.nii.gz")
+        image = sf.load_volume(filename)
+        new_voxsize = [dynamic_resize(image)]*3
+    
+        
+        orig_voxsize = image.geom.voxsize
+        image = image.resize([orig_voxsize[0], orig_voxsize[1], 1], method="linear")
+        image = image.resize(new_voxsize).reshape([192, 192, 192, 1])
+
+    
+        mask = sf.load_volume(mask_filename).resize([orig_voxsize[0], orig_voxsize[1], 1], method="linear")
+        mask = mask.resize(new_voxsize).reshape([192, 192, 192, 1])
+        mask.data[mask.data != 0] = 1
+    
+        x1, y1, z1, x2, y2, z2 = find_bounding_box(mask,cube_size=dim_)
+        print(x1,y1,z1,x2,y2,z2)
+        crop_img = extract_cube(image.data,x1, y1, z1, x2, y2, z2)
+        crop_img = image.resize([orig_voxsize[0],orig_voxsize[1],1], method="linear")
+        crop_img = crop_img.resize(new_voxsize, method="linear").reshape([dim_, dim_, dim_])
+        mask = extract_cube(mask.data, x1, y1, z1, x2, y2, z2, cube_size=dim_)
+        
+        mask = tf.one_hot(mask,depth=2)
+        image_mask_pairs.append((crop_img,mask))
+    
+        
+    return image_mask_pairs
+ 
                 
 def generator_brain_window_Net(label_maps,img_size):
     rand = np.random.default_rng()
     label_maps = np.asarray(label_maps)
-    
-    
     while True:
         fg = rand.choice(label_maps)
         yield fg[None,...,None]
+
+def generator_brain_body(label_maps):
+    def create_ellipsoid(center, radii, shape):
+        z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+        a, b, c = radii
+        cz, cy, cx = center
+        
+        ellipsoid_mask = ((z - cz) / a) ** 2 + ((y - cy) / b) ** 2 + ((x - cx) / c) ** 2 <= 1
+        return ellipsoid_mask
+
+    def create_patch(center, radius, shape):
+        z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+        cz, cy, cx = center
+        
+        patch_mask = (np.sqrt((z - cz) ** 2 + (y - cy) ** 2 + (x - cx) ** 2) <= radius)
+        return patch_mask
+    
+    def place_large_patches(volume, ellipsoid_mask, num_patches, patch_radius, min_label=9, max_label=16):
+        labels = np.random.randint(min_label, max_label + 1, num_patches)
+        indices = np.argwhere(ellipsoid_mask)
+        
+        if len(indices) == 0:
+            raise ValueError("Ellipsoid mask is empty. No valid locations for patches.")
+        
+        selected_indices = indices[np.random.choice(indices.shape[0], num_patches, replace=False)]
+        
+        for idx, (z, y, x) in enumerate(selected_indices):
+            patch_mask = create_patch((z, y, x), patch_radius, volume.shape)
+            volume[patch_mask] = labels[idx]
+        
+        return volume
+    
+    def attach_ellipsoid_to_volume(volume, min_radius=10, num_patches=10, patch_radius=4):
+        non_zero_indices = np.nonzero(volume)
+        
+        if len(non_zero_indices[0]) == 0:
+            raise ValueError("No non-zero elements found in the input volume.")
+        
+        # Select a random non-zero element
+        anchor_idx = np.random.randint(len(non_zero_indices[0]))
+        z_anchor, y_anchor, x_anchor = non_zero_indices[0][anchor_idx], non_zero_indices[1][anchor_idx], non_zero_indices[2][anchor_idx]
+        
+        # Determine ellipsoid semi-axes based on the extent of non-zero elements
+        non_zero_extent = np.array([np.max(non_zero_indices[i]) - np.min(non_zero_indices[i]) for i in range(3)])
+        min_radius = np.maximum(non_zero_extent, min_radius)
+        
+        # Randomly shuffle the stretch factors
+        base_stretch_factors = np.array([0.5, 0.6, 0.3])
+        stretch_factor = np.random.permutation(base_stretch_factors)
+        
+        # Create ellipsoid centered at the non-zero element
+        semi_axes = min_radius * stretch_factor
+        ellipsoid = create_ellipsoid((z_anchor, y_anchor, x_anchor), semi_axes, volume.shape)
+        
+        # Calculate the maximum shift amounts
+        max_shift_x = min(volume.shape[2] - (x_anchor + semi_axes[2]), x_anchor)
+        max_shift_y = min(volume.shape[1] - (y_anchor + semi_axes[1]), y_anchor)
+        max_shift_z = min(volume.shape[0] - (z_anchor + semi_axes[0]), z_anchor)
+        
+        # Calculate the minimum shift required to ensure non-overlap
+        min_shift_x = int(np.ceil(semi_axes[2] * 1.5))  # 1.5 times the semi-axis
+        min_shift_y = int(np.ceil(semi_axes[1] * 1.5))
+        min_shift_z = int(np.ceil(semi_axes[0] * 1.5))
+        
+        # Ensure that the shift amount is within bounds
+        shift_direction = np.random.choice(['x', 'y', 'z'])
+        
+        if shift_direction == 'x':
+            if min_shift_x > max_shift_x:
+                x_shift = 0
+            else:
+                x_shift = np.random.randint(min_shift_x, max_shift_x + 1)
+            y_shift = 0
+            z_shift = 0
+        elif shift_direction == 'y':
+            if min_shift_y > max_shift_y:
+                y_shift = 0
+            else:
+                y_shift = np.random.randint(min_shift_y, max_shift_y + 1)
+            x_shift = 0
+            z_shift = 0
+        else:
+            if min_shift_z > max_shift_z:
+                z_shift = 0
+            else:
+                z_shift = np.random.randint(min_shift_z, max_shift_z + 1)
+            x_shift = 0
+            y_shift = 0
+        
+        new_center = (
+            min(max(z_anchor + z_shift, 0), volume.shape[0] - 1),
+            min(max(y_anchor + y_shift, 0), volume.shape[1] - 1),
+            min(max(x_anchor + x_shift, 0), volume.shape[2] - 1)
+        )
+        
+        ellipsoid_shifted = create_ellipsoid(new_center, semi_axes, volume.shape)
+        
+        # Ensure the mask fits within the volume bounds
+        ellipsoid_shifted = np.logical_and(ellipsoid_shifted, np.ones(volume.shape, dtype=bool))
+        
+        updated_volume = np.copy(volume)
+        updated_volume[ellipsoid_shifted] = 8  # Set the ellipsoid's value to 8
+        
+        # Place large patches inside the ellipsoid
+        updated_volume = place_large_patches(updated_volume, ellipsoid_shifted, num_patches, patch_radius)
+        
+        return updated_volume
+    
+    rand = np.random.default_rng()
+    label_maps = np.asarray(label_maps)
+    while True:
+        fg = rand.choice(label_maps)
+        new_fg = attach_ellipsoid_to_volume(fg)
+        yield new_fg[None,...,None]
+        
+def generator_brain_on_off(label_maps, img_size):
+    rand = np.random.default_rng()
+    label_maps = np.asarray(label_maps)
+    
+    while True:
+        if rand.random() < 0.3:
+            # Generate a fully zero fg with the same shape as a label map
+            fg = np.zeros_like(label_maps[0])
+        else:
+            # Randomly select a label map and keep its size
+            fg = rand.choice(label_maps)
+        
+        yield fg[None, ..., None]
         
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
 
-        
 
-def generate_position_map(volume_shape, patch_size, stride):
-    positions = []
-    indices = []
-    index = 0
-    for x1 in range(0, volume_shape[0] - patch_size + stride, stride):
-        for y1 in range(0, volume_shape[1] - patch_size + stride, stride):
-            for z1 in range(0, volume_shape[2] - patch_size + stride, stride):
+
+
+def find_unique_components(mask1, mask2):
+    """
+    Find connected components in mask1 that are not present in mask2.
+
+    Parameters:
+    mask1 (ndarray): The first 3D binary mask.
+    mask2 (ndarray): The second 3D binary mask.
+
+    Returns:
+    ndarray: A new mask containing connected components present in mask1 but not in mask2.
+    """
+    from scipy.ndimage import label
+    from skimage.measure import regionprops
+    # Ensure masks are binary
+    mask1 = mask1.astype(bool)
+    mask2 = mask2.astype(bool)
+    
+    # Label connected components in both masks
+    labeled_mask1, num_features1 = label(mask1)
+    labeled_mask2, num_features2 = label(mask2)
+
+    # Initialize a new mask for unique components
+    unique_components_mask = np.zeros_like(mask1)
+
+    # Iterate through each region in the first mask
+    for region in regionprops(labeled_mask1):
+        # Check if any part of the region overlaps with mask2
+        if np.all(mask2[labeled_mask1 == region.label] == 0):
+            # If no overlap, add the region to the unique components mask
+            unique_components_mask[labeled_mask1 == region.label] = 1
+
+    return unique_components_mask
+
+
+def add_positions(positions,patch_size, mask):
+
+    # Add the position that surrounds non-zero elements of the mask
+    positions_list = positions
+    x1, y1, z1, x2, y2, z2 = find_bounding_box(mask, cube_size=patch_size)
+    positions_list.append((x1, y1, z1, x2, y2, z2))
+    
+    # Add 10 more positions around the bounding box with a maximum shift of 5 voxels
+    for _ in range(10):
+        shift_x = np.random.randint(-2, 2)
+        shift_y = np.random.randint(-2, 2)
+        shift_z = np.random.randint(-2, 2)
+        
+        new_x1 = x1 + shift_x
+        new_y1 = y1 + shift_y
+        new_z1 = z1 + shift_z
+        
+        new_x2 = new_x1 + patch_size
+        new_y2 = new_y1 + patch_size
+        new_z2 = new_z1 + patch_size
+        
+        # Check if new coordinates are within bounds
+        # if new_x1 < 0 or new_y1 < 0 or new_z1 < 0:
+        #     continue
+        # if new_x2 > volume_shape[0] or new_y2 > volume_shape[1] or new_z2 > volume_shape[2]:
+        #     continue
+        
+        positions_list.append((new_x1, new_y1, new_z1, new_x2, new_y2, new_z2))
+    
+
+    return positions_list
+
+def count_coverage(volume_shape, patch_size, stride):
+    coverage = np.zeros(volume_shape, dtype=int)
+    
+    for x1 in range(0, volume_shape[0] - patch_size + 1, stride):
+        for y1 in range(0, volume_shape[1] - patch_size + 1, stride):
+            for z1 in range(0, volume_shape[2] - patch_size + 1, stride):
                 x2 = x1 + patch_size
                 y2 = y1 + patch_size
                 z2 = z1 + patch_size
-                positions.append((x1, y1, z1, x2, y2, z2))
-                indices.append(index)
-                index += 1
-    return positions, indices
+                
+                coverage[x1:x2, y1:y2, z1:z2] += 1
+    
+    return coverage
+
+import random
+
+import random
+
+def generate_position_map(volume_shape, patch_size, stride):
+    coverage = count_coverage(volume_shape, patch_size, stride)
+    positions = []
+    
+    # Generate all possible cube positions
+    for x1 in range(0, volume_shape[0] - patch_size + 1, stride):
+        for y1 in range(0, volume_shape[1] - patch_size + 1, stride):
+            for z1 in range(0, volume_shape[2] - patch_size + 1, stride):
+                x2 = x1 + patch_size
+                y2 = y1 + patch_size
+                z2 = z1 + patch_size
+                
+                # Calculate the weight of this cube based on voxel coverage
+                cube_weight = np.sum(coverage[x1:x2, y1:y2, z1:z2])
+                
+                # Add the position with its weight
+                if cube_weight > 0:
+
+                    positions.append(((x1, y1, z1, x2, y2, z2), cube_weight))
+    
+    # Normalize weights and adjust the position list
+    if positions:
+        total_weight = sum(weight for _, weight in positions)
+        normalized_positions = []
+        
+        for (pos, weight) in positions:
+            # Adjust sample count based on the weight
+            sample_count = int(weight / total_weight * len(positions))
+            normalized_positions.extend([pos] * sample_count)
+    
+    # Shuffle positions to mix them up
+    np.random.shuffle(normalized_positions)
+    
+    return normalized_positions
+    
+
+
+# def generate_position_map(volume_shape, patch_size, stride):
+#     positions = set()
+#     indices = []
+#     index = 0
+
+#     # Generate positions based on stride
+#     for x1 in range(0, volume_shape[0] - patch_size + 1, stride):
+#         for y1 in range(0, volume_shape[1] - patch_size + 1, stride):
+#             for z1 in range(0, volume_shape[2] - patch_size + 1, stride):
+#                 x2 = x1 + patch_size
+#                 y2 = y1 + patch_size
+#                 z2 = z1 + patch_size
+#                 positions.add((x1, y1, z1, x2, y2, z2))
+
+#     # Convert set to list and generate indices
+#     positions = list(positions)
+
+#     return positions
+
+
 import tensorflow as tf
+
+def generator_validation(image_mask_pairs):                                                                                             
+    while True:
+        for x, y in image_mask_pairs:
+            x = tf.convert_to_tensor(x, dtype=tf.float32)  # Assuming x is your image                                                   
+            y = tf.convert_to_tensor(y, dtype=tf.float32)  # Assuming y is your mask                                                    
+            yield x[None,...,None] , y[None,...,None]
+
 
 def generate_position_map_tf(volume_shape, patch_size, stride):
     positions = []
@@ -272,48 +571,152 @@ def convert_to_binary_vector(pattern_list):
     binary_vector = [1 if pattern is not None else 0 for pattern in pattern_list]
     return binary_vector
 
-# def find_bounding_box(mask, cube_size=32):
-#     non_zero_coords = np.argwhere(mask)
-#     min_coords = non_zero_coords.min(axis=0)
-#     max_coords = non_zero_coords.max(axis=0)
-#     center = (min_coords + max_coords) // 2
-#     half_size = cube_size // 2
-#     x1 = max(center[0] - half_size, 0)
-#     y1 = max(center[1] - half_size, 0)
-#     z1 = max(center[2] - half_size, 0)
-#     x2 = min(center[0] + half_size, mask.shape[0])
-#     y2 = min(center[1] + half_size, mask.shape[1])
-#     z2 = min(center[2] + half_size, mask.shape[2])
-#     return x1, y1, z1, x2, y2, z2
-
 def find_bounding_box(mask, cube_size=32, max_dim=192):
     non_zero_coords = np.argwhere(mask)
-    min_coords = non_zero_coords.min(axis=0)
-    max_coords = non_zero_coords.max(axis=0)
-    center = (min_coords + max_coords) // 2
+    
+    if non_zero_coords.size == 0:
+        # If there are no non-zero elements, choose the cube in the center
+        center = np.array(mask.shape) // 2
+    else:
+        min_coords = non_zero_coords.min(axis=0)
+        max_coords = non_zero_coords.max(axis=0)
+        center = (min_coords + max_coords) // 2
+    
     half_size = cube_size // 2
 
-    # Ensure that the bounding box does not exceed the maximum dimension
+    # Calculate initial coordinates
     x1 = max(center[0] - half_size, 0)
     y1 = max(center[1] - half_size, 0)
     z1 = max(center[2] - half_size, 0)
 
-    x2 = min(center[0] + half_size, min(mask.shape[0], max_dim))
-    y2 = min(center[1] + half_size, min(mask.shape[1], max_dim))
-    z2 = min(center[2] + half_size, min(mask.shape[2], max_dim))
+    x2 = min(x1 + cube_size, mask.shape[0])
+    y2 = min(y1 + cube_size, mask.shape[1])
+    z2 = min(z1 + cube_size, mask.shape[2])
+
+    # Adjust if the cube size is smaller than the desired cube size
+    if x2 - x1 < cube_size:
+        if x1 == 0:
+            x2 = min(cube_size, mask.shape[0])
+        else:
+            x1 = max(x2 - cube_size, 0)
+
+    if y2 - y1 < cube_size:
+        if y1 == 0:
+            y2 = min(cube_size, mask.shape[1])
+        else:
+            y1 = max(y2 - cube_size, 0)
+
+    if z2 - z1 < cube_size:
+        if z1 == 0:
+            z2 = min(cube_size, mask.shape[2])
+        else:
+            z1 = max(z2 - cube_size, 0)
 
     return x1, y1, z1, x2, y2, z2
+def calibrate_positions(x1, y1, z1, x2, y2, z2, mini_cube_size, max_cube_size):
+    x2 = min(x2, max_cube_size)
+    y2 = min(y2, max_cube_size)
+    z2 = min(z2, max_cube_size)
+
+    # Adjust start coordinates if necessary to maintain the mini cube size
+    x1 = max(x2 - mini_cube_size, 0)
+    y1 = max(y2 - mini_cube_size, 0)
+    z1 = max(z2 - mini_cube_size, 0)
+
+    return x1, y1, z1, x2, y2, z2
+    
+import numpy as np
+
+import numpy as np
+
+# def find_bounding_box(mask, cube_size=32, max_dim=192):
+#     non_zero_coords = np.argwhere(mask)
+    
+#     if non_zero_coords.size == 0:
+#         # If no non-zero elements, return a default bounding box in the center
+#         center = np.array(mask.shape) // 2
+#         half_size = cube_size // 2
+#         x1, y1, z1 = center - half_size
+#         x2, y2, z2 = center + half_size
+#     else:
+#         min_coords = non_zero_coords.min(axis=0)
+#         max_coords = non_zero_coords.max(axis=0)
+        
+#         # Calculate center of non-zero elements
+#         center = (min_coords + max_coords) // 2
+        
+#         # Calculate half size based on cube size
+#         half_size = cube_size // 2
+        
+#         # Calculate bounding box coordinates
+#         x1 = max(center[0] - half_size, 0)
+#         y1 = max(center[1] - half_size, 0)
+#         z1 = max(center[2] - half_size, 0)
+#         x2 = min(center[0] + half_size, mask.shape[0])
+#         y2 = min(center[1] + half_size, mask.shape[1])
+#         z2 = min(center[2] + half_size, mask.shape[2])
+        
+#         # Adjust if bounding box exceeds max_dim
+#         if x2 - x1 > max_dim:
+#             x1 = center[0] - max_dim // 2
+#             x2 = x1 + max_dim
+#         if y2 - y1 > max_dim:
+#             y1 = center[1] - max_dim // 2
+#             y2 = y1 + max_dim
+#         if z2 - z1 > max_dim:
+#             z1 = center[2] - max_dim // 2
+#             z2 = z1 + max_dim
+        
+#     return x1, y1, z1, x2, y2, z2
+
+
+
+
 
 def find_random_bounding_box(input_volume, cube_size=32, margin=8, full_random=False):
     if full_random:
-        return find_full_random_bounding_box(input_volume,cube_size)
+        return find_full_random_bounding_box(input_volume, cube_size)
+    
     non_zero_coords = np.argwhere(input_volume)
-    min_coords = non_zero_coords.min(axis=0) - margin
-    max_coords = non_zero_coords.max(axis=0) + margin
-    random_coords = [np.random.randint(min_c, max_c - cube_size + 1) for min_c, max_c in zip(min_coords, max_coords)]
+    if non_zero_coords.size == 0:
+        # If no non-zero elements, return the central bounding box
+        center = np.array(input_volume.shape) // 2
+        half_size = cube_size // 2
+        x1, y1, z1 = center - half_size
+        x2, y2, z2 = center + half_size
+        return x1, y1, z1, x2, y2, z2
+
+    min_coords = np.maximum(non_zero_coords.min(axis=0) - margin, 0)
+    max_coords = np.minimum(non_zero_coords.max(axis=0) + margin, np.array(input_volume.shape) - cube_size)
+    
+    random_coords = [np.random.randint(min_c, max_c + 1) for min_c, max_c in zip(min_coords, max_coords)]
     x1, y1, z1 = random_coords
     x2, y2, z2 = x1 + cube_size, y1 + cube_size, z1 + cube_size
+
+    # Ensure the bounding box is within the input volume size
+    if x2 > input_volume.shape[0]:
+        x1 = input_volume.shape[0] - cube_size
+        x2 = input_volume.shape[0]
+    if y2 > input_volume.shape[1]:
+        y1 = input_volume.shape[1] - cube_size
+        y2 = input_volume.shape[1]
+    if z2 > input_volume.shape[2]:
+        z1 = input_volume.shape[2] - cube_size
+        z2 = input_volume.shape[2]
+
     return x1, y1, z1, x2, y2, z2
+
+
+# def find_random_bounding_box(input_volume, cube_size=32, margin=8, full_random=False):
+#     if full_random:
+#         return find_full_random_bounding_box(input_volume,cube_size)
+#     non_zero_coords = np.argwhere(input_volume)
+#     min_coords = non_zero_coords.min(axis=0) - margin
+#     max_coords = non_zero_coords.max(axis=0) + margin
+#     random_coords = [np.random.randint(min_c, max_c - cube_size + 1) for min_c, max_c in zip(min_coords, max_coords)]
+#     x1, y1, z1 = random_coords
+#     x2, y2, z2 = x1 + cube_size, y1 + cube_size, z1 + cube_size
+#     return x1, y1, z1, x2, y2, z2
     
 def find_full_random_bounding_box(input_volume, cube_size=32):
     x_max, y_max, z_max = input_volume.shape
@@ -326,6 +729,7 @@ def find_full_random_bounding_box(input_volume, cube_size=32):
     return x1, y1, z1, x2, y2, z2
     
 def extract_cube(input_volume, x1, y1, z1, x2, y2, z2, cube_size=32):
+    cube_size = x2-x1
     cube = np.zeros((cube_size, cube_size, cube_size))
     x_size, y_size, z_size = x2 - x1, y2 - y1, z2 - z1
     cube[:x_size, :y_size, :z_size] = input_volume[x1:x2, y1:y2, z1:z2]
@@ -347,6 +751,199 @@ def extract_cube(input_volume, x1, y1, z1, x2, y2, z2, cube_size=32):
 #     x_size, y_size, z_size = min(x2 - x1, max_cube_size), min(y2 - y1, max_cube_size), min(z2 - z1, max_cube_size)
 #     cube[:x_size, :y_size, :z_size] = input_volume[x1:x1 + x_size, y1:y1 + y_size, z1:z1 + z_size]
 #     return cube
+
+def create_oval_around_fg(fg, margin=4):
+    """
+    Create an oval shape surrounding the non-zero elements of the foreground.
+
+    Args:
+    fg (tf.Tensor): 3D tensor representing the foreground.
+    margin (int): Margin to add around the foreground.
+
+    Returns:
+    tf.Tensor: 3D tensor representing the oval shape.
+    """
+    # Get the non-zero coordinates of fg
+    non_zero_coords = tf.where(tf.not_equal(fg, 0))
+    
+    # Calculate the center and radii for the oval
+    min_coords = tf.reduce_min(non_zero_coords, axis=0)
+    max_coords = tf.reduce_max(non_zero_coords, axis=0)
+    center = (min_coords + max_coords) // 2
+    radii = (max_coords - min_coords) // 2 + margin
+
+    # Create a grid of coordinates
+    grid = tf.stack(tf.meshgrid(tf.range(fg.shape[0]), tf.range(fg.shape[1]), tf.range(fg.shape[2]), indexing='ij'), axis=-1)
+    
+    # Calculate the distances from the center
+    distances = tf.reduce_sum(((tf.cast(grid, tf.float32) - tf.cast(center, tf.float32)) / tf.cast(radii, tf.float32)) ** 2, axis=-1)
+    
+    # Create an oval shape (ellipsoid)
+    oval = distances <= 1
+
+    return tf.cast(oval, tf.uint8)
+
+def weighted_centroid(pred_24):
+    # Ensure pred_24 is a numpy array
+    pred_24 = np.array(pred_24)
+    
+    # Get the coordinates of each voxel
+    x_coords, y_coords, z_coords = np.indices(pred_24.shape)
+    
+    # Calculate the weighted sum of coordinates
+    total_weight = np.sum(pred_24)
+    weighted_sum_x = np.sum(x_coords * pred_24)
+    weighted_sum_y = np.sum(y_coords * pred_24)
+    weighted_sum_z = np.sum(z_coords * pred_24)
+    
+    # Compute the weighted centroid
+    centroid_x = weighted_sum_x / total_weight
+    centroid_y = weighted_sum_y / total_weight
+    centroid_z = weighted_sum_z / total_weight
+    
+    return (centroid_x, centroid_y, centroid_z)
+    
+import numpy as np
+
+def shift_cube_by_k_voxels(pred_24, k, x1, y1, z1, x2, y2, z2, img_size_24, img_size_48):
+    # Get non-zero coordinates
+    non_zero_coords = np.argwhere(pred_24 > 0)
+    
+    # Compute the centroid of non-zero elements
+    centroid = non_zero_coords.mean(axis=0).astype(int)
+    
+    # Calculate shifts based on the centroid relative to the center of the cube
+    shifts = (np.sign(centroid - np.array(pred_24.shape) / 2) * k).astype(int)
+
+    # New coordinates after applying the shift
+    x1_new = max(0, int(x1 + shifts[0]))
+    y1_new = max(0, int(y1 + shifts[1]))
+    z1_new = max(0, int(z1 + shifts[2]))
+
+    # Compute the new x2, y2, z2 ensuring the cube remains within the bounds
+    x2_new = min(x1_new + img_size_24, img_size_48)
+    y2_new = min(y1_new + img_size_24, img_size_48)
+    z2_new = min(z1_new + img_size_24, img_size_48)
+
+    # Ensure that the cube size remains consistent
+    if x2_new - x1_new != img_size_24:
+        x1_new = max(0, x2_new - img_size_24)
+    if y2_new - y1_new != img_size_24:
+        y1_new = max(0, y2_new - img_size_24)
+    if z2_new - z1_new != img_size_24:
+        z1_new = max(0, z2_new - img_size_24)
+
+    # Final adjustment to make sure the cube is within bounds
+    x2_new = min(x1_new + img_size_24, img_size_48)
+    y2_new = min(y1_new + img_size_24, img_size_48)
+    z2_new = min(z1_new + img_size_24, img_size_48)
+
+    return x1_new, y1_new, z1_new, x2_new, y2_new, z2_new
+
+    
+                    
+def create_oval(shape, center, radii):
+    grid = tf.stack(tf.meshgrid(tf.range(shape[0], dtype=tf.int32), tf.range(shape[1], dtype=tf.int32), tf.range(shape[2], dtype=tf.int32), indexing='ij'), axis=-1)
+    center = tf.reshape(center, (1, 1, 1, -1))  # Reshape center for broadcasting
+    radii = tf.reshape(radii, (1, 1, 1, -1))    # Reshape radii for broadcasting
+    distances = tf.reduce_sum(((tf.cast(grid, tf.float32) - tf.cast(center, tf.float32)) / tf.cast(radii, tf.float32)) ** 2, axis=-1)
+    oval = distances <= 1
+    return tf.cast(oval, tf.uint8)
+
+def create_oval_around_fg(fg, margin=10):
+    non_zero_coords = tf.where(tf.not_equal(fg, 0))
+    min_coords = tf.reduce_min(non_zero_coords, axis=0)
+    max_coords = tf.reduce_max(non_zero_coords, axis=0)
+    center = (min_coords + max_coords) // 2
+    radii = (max_coords - min_coords) // 2 + margin
+    return create_oval(fg.shape, center, radii)
+
+
+def create_smaller_oval_adjacent_to_fg(fg, margin1=30, margin2=1, size_fraction=0.3, shift=20):
+    main_oval = create_oval_around_fg(fg, margin1)
+    non_zero_coords = tf.where(main_oval)
+    min_coords = tf.reduce_min(non_zero_coords, axis=0)
+    max_coords = tf.reduce_max(non_zero_coords, axis=0)
+    center = tf.cast((min_coords + max_coords) // 2, dtype=tf.int32)
+    radii = tf.cast((max_coords - min_coords) // 2 + margin2, tf.float32)
+    smaller_radii = tf.cast(radii * size_fraction, dtype=tf.int32)
+    
+    # Determine the direction to shift the smaller oval
+    fg_center = tf.cast(tf.reduce_mean(non_zero_coords, axis=0), dtype=tf.int32)
+    shift_direction = tf.constant([shift, 0, 0], dtype=tf.int32)
+    
+    smaller_center = center + shift_direction
+    smaller_oval = create_oval(fg.shape, smaller_center, smaller_radii)
+    return main_oval, smaller_oval
+    
+
+def create_ellipsoid_around_brain(brain_volume, margin=2, stretch_range=(1.0, 3.0)):
+    """
+    Create a randomly stretched ellipsoid around the brain volume.
+
+    Args:
+        brain_volume (tf.Tensor): 3D tensor of the brain volume.
+        margin (int): Additional margin to add around the brain bounding box.
+        stretch_range (tuple): Range of factors to stretch the ellipsoid along each axis.
+
+    Returns:
+        tf.Tensor: 3D tensor of the ellipsoid mask.
+    """
+    # Find the bounding box of the brain
+    non_zero_indices = tf.where(brain_volume > 0)
+    min_z, max_z = tf.reduce_min(non_zero_indices[:, 0]), tf.reduce_max(non_zero_indices[:, 0])
+    min_y, max_y = tf.reduce_min(non_zero_indices[:, 1]), tf.reduce_max(non_zero_indices[:, 1])
+    min_x, max_x = tf.reduce_min(non_zero_indices[:, 2]), tf.reduce_max(non_zero_indices[:, 2])
+
+    # Calculate the center and radii of the ellipsoid
+    center = tf.cast([(max_z + min_z) / 2, (max_y + min_y) / 2, (max_x + min_x) / 2], tf.float32)
+    radii = tf.cast([(max_z - min_z) / 2, (max_y - min_y) / 2, (max_x - min_x) / 2], tf.float32) + margin
+
+    # Generate random stretch factors
+    random_stretch_factors = tf.random.uniform(shape=[3], minval=stretch_range[0], maxval=stretch_range[1], dtype=tf.float32)
+    
+    # Apply the random stretch factors to the radii
+    radii = radii * random_stretch_factors
+
+    # Create a grid of coordinates
+    z = tf.range(brain_volume.shape[0], dtype=tf.float32)
+    y = tf.range(brain_volume.shape[1], dtype=tf.float32)
+    x = tf.range(brain_volume.shape[2], dtype=tf.float32)
+    
+    z_grid, y_grid, x_grid = tf.meshgrid(z, y, x, indexing='ij')
+
+    # Calculate the ellipsoid formula
+    ellipsoid = ((x_grid - center[2]) ** 2 / radii[2] ** 2 +
+                 (y_grid - center[1]) ** 2 / radii[1] ** 2 +
+                 (z_grid - center[0]) ** 2 / radii[0] ** 2) <= 1
+
+    return tf.cast(ellipsoid, tf.uint8)
+    
+
+def wrap_with_label_tf(volume, thickness=1, iterations=1):
+    # Convert volume to float32 for smoother operations
+    volume = tf.cast(volume, dtype=tf.float32)
+    
+    # Create a mask where 1 represents non-zero elements in the volume
+    non_zero_mask = tf.cast(tf.not_equal(volume, 0), dtype=tf.float32)
+    
+    # Define a kernel for convolution
+    kernel_size = 2 * thickness + 1  # Ensuring the kernel covers the thickness properly
+    kernel = tf.ones((kernel_size, kernel_size, kernel_size, 1, 1), dtype=tf.float32)
+    
+    # Convolve the non_zero_mask multiple times to create a thicker and smoother ring
+    smoothed_mask = non_zero_mask
+    for _ in range(iterations):
+        smoothed_mask = tf.nn.conv3d(smoothed_mask, kernel, strides=[1, 1, 1, 1, 1], padding='SAME')
+        smoothed_mask = tf.minimum(smoothed_mask, 1.0)  # Ensure values are within [0, 1]
+    
+    # Create a mask for the final wrapped volume (excluding original non-zero elements)
+    wrapped_mask = tf.cast(tf.logical_and(tf.equal(smoothed_mask, 1), tf.equal(non_zero_mask, 0)), dtype=tf.uint8)
+    
+    # Combine original volume and wrapped mask
+    wrapped_volume = tf.cast(volume, dtype=tf.uint8) + wrapped_mask * 8
+    
+    return wrapped_volume
     
 def extract_fragments(input_volume, positions):
     fragments = []
@@ -377,6 +974,26 @@ def apply_gaussian_smoothing(tensor,sigma = 1.0,kernel_size = 3):
     kernel = tf.tile(kernel, [1, kernel_size, 1, 1, 1])
     kernel = tf.tile(kernel, [1, 1, kernel_size, 1, 1])
     return tf.nn.conv3d(tensor, kernel, strides=[1, 1, 1, 1, 1], padding='SAME')
+
+
+def add_random_blur(image, blur_prob=0.05, sigma=1.0, kernel_size=5):
+    # Convert to 3D tensor if needed
+    if len(image.shape) == 5:
+        image = image[0, ..., 0]  # Shape: (depth, height, width, channels)
+
+    # Apply blurring with probability
+    if tf.random.uniform([]) < blur_prob:
+        blurred_image = apply_gaussian_smoothing(image, sigma=sigma, kernel_size=kernel_size)
+    else:
+        blurred_image = image
+
+    # Ensure the image is within original value range if necessary
+    # blurred_image = tf.clip_by_value(blurred_image, tf.reduce_min(image), tf.reduce_max(image))
+    
+    # Add batch and channel dimensions back
+    blurred_image = blurred_image = blurred_image[None,...,None]
+    
+    return blurred_image
     
 def shift_non_zero_elements(bg, shift_value):
     non_zero_mask = tf.not_equal(bg, 0)
@@ -526,7 +1143,178 @@ def combined_generator_12Net(brain_maps, model_feta,model_shapes,labels_to_image
     for label_map in generator_brain_label_maps(brain_maps):
         for fragment, label in generator_fragments_and_labels(label_map, model_feta,model_shapes,labels_to_image_model,param_3d.img_size_12 ,batch_size):
             yield fragment, label
-            
+
+
+import numpy as np
+from scipy import ndimage
+from skimage.measure import label, regionprops
+
+
+def center_weighting_mask(shape, center_weight, boundary_weight):
+    z, y, x = np.indices(shape)
+    center = np.array([s // 2 for s in shape])
+    dist = np.sqrt((x - center[2])**2 + (y - center[1])**2 + (z - center[0])**2)
+    max_dist = np.sqrt(center[0]**2 + center[1]**2 + center[2]**2)
+    return np.clip(center_weight - (center_weight - boundary_weight) * (dist / max_dist), boundary_weight, center_weight)
+
+def min_max_normalize(mask):
+    min_val, max_val = np.min(mask), np.max(mask)
+    return (mask - min_val) / (max_val - min_val) if max_val > min_val else mask
+
+def consensus_based_combination(pred_list, weights, center_weight=1.0, boundary_weight=0.1):
+    weight_mask = center_weighting_mask(pred_list[0].shape, center_weight, boundary_weight)
+    normalized_masks = [min_max_normalize(mask) for mask in pred_list]
+    combined = sum(mask * weight * weight_mask for mask, weight in zip(normalized_masks, weights))
+    consensus_mask = np.sum(np.array(normalized_masks) > 0, axis=0) >= 2
+    return np.where(consensus_mask, combined, 0)
+
+def process_predictions(pred_list, param_3d):
+    num_masks = len(pred_list)
+    weights = np.linspace(1, num_masks, num_masks) / num_masks
+    combined_mask = consensus_based_combination(pred_list, weights, center_weight=1.0, boundary_weight=0.1)
+    binary_mask = combined_mask > (np.max(combined_mask) / 2)
+    if np.sum(binary_mask) == 0:
+        binary_mask = pred_list[0] == np.max(pred_list[0])
+    return ndimage.binary_opening(ndimage.binary_closing(find_largest_component(binary_mask), structure=np.ones((3, 3, 3))), structure=np.ones((3, 3, 3))).astype(np.uint8)
+
+
+
+# def process_predictions(pred_list, param_3d):
+#     """
+#     Process the prediction masks by combining them, finding large components,
+#     and applying closing and hole filling.
+
+#     Parameters:
+#     - pred_list: List of prediction masks to be combined.
+#     - param_3d: Parameters object containing min_area, median_area, max_area, and img_size_48.
+
+#     Returns:
+#     - Processed prediction mask.
+#     """
+#     # pred_192 = pred_list[-1]> np.max(pred_list[-1])-2
+#     # structure = np.ones((2, 2,2))  # Define the structuring element
+    
+    
+#     pred_192 = combine_masks_sum(pred_list)
+#     pred_192 = pred_192 > np.max(pred_192)/2
+#     # pred_192 = get_final_combined_mask(pred_list)
+#     # max_val = np.max(pred_192)
+#     # # thresholds = [max_val / i for i in range(50, 40, -10)]
+#     # # threshold_masks = [(pred_192 > threshold).astype(int) for threshold in thresholds]
+#     # pred_192 = pred_192> 0#/5#combine_masks_majority_voting(threshold_masks)
+    
+#     # pred_192 = find_large_components(pred_192,min_area=param_3d.min_area, max_area=param_3d.max_area)
+#     pred_192 = find_largest_component(pred_192)#
+#     pred_192 = ndimage.binary_opening(pred_192, structure=np.ones((3, 3, 3))).astype(np.uint8)
+#     # # Perform closing to fill small holes
+#     pred_192 = ndimage.binary_closing(pred_192, structure=np.ones((3, 3, 3))).astype(np.uint8)
+
+#     # labeled_mask, num_features = ndimage.label(pred_192)
+#     # min_area = param_3d.median_area if num_features > 1 else param_3d.min_area
+#     # nib.save(nib.Nifti1Image(pred_192.astype(np.float32), np.array(img.geom.vox2world)), f"{folder_path}/cascade.nii.gz")
+#     return pred_192
+    
+
+# def process_predictions(pred_list, param_3d):
+#     """
+#     Process the prediction masks by combining them, finding large components,
+#     and applying closing and hole filling.
+
+#     Parameters:
+#     - pred_list: List of prediction masks to be combined.
+#     - param_3d: Parameters object containing min_area, median_area, max_area, and img_size_48.
+
+#     Returns:
+#     - Processed prediction mask.
+#     """
+#     structure = np.ones((1, 1, 1))  # Define the structuring element
+    
+#     # Combine masks using majority voting
+    
+#     pred_192 = combine_masks_sum(pred_list)
+#     max_val = np.max(pred_192)
+#     thresholds = [max_val / i for i in range(100, 10, -10)]
+#     threshold_masks = [(pred_192 > threshold).astype(int) for threshold in thresholds]
+    
+#     # threshold = np.max(pred_192)/100
+#     # pred2 = pred_192 > threshold
+#     pred1 = combine_masks_majority_voting(pred_list)
+#     pred_192 = combine_masks_majority_voting([pred1]+threshold_masks)
+
+#     # pred_192 = remove_outside_outliers(pred_192, iterations=3)
+#     #combine_masks_majority_voting(pred_list)
+    
+#     # Adjust min_area based on the number of connected components
+#     labeled_mask, num_features = ndimage.label(pred_192)
+#     min_area = param_3d.median_area if num_features > 1 else param_3d.min_area
+    
+#     # Find large components
+#     pred_192 = find_large_components(pred_192, min_area=min_area, max_area=param_3d.max_area)
+    
+#     # Apply morphological closing to fill concave regions and close bindings
+#     pred_192 = ndimage.binary_closing(pred_192, structure=structure).astype(int)
+    
+#     # Fill small and big holes
+#     pred_192 = ndimage.binary_fill_holes(pred_192).astype(int)
+#     return pred_192
+    
+# def process_predictions(pred_list, param_3d):
+#     """
+#     Process the prediction masks by combining them, finding large components,
+#     and applying closing and hole filling.
+
+#     Parameters:
+#     - pred_list: List of prediction masks to be combined.
+#     - param_3d: Parameters object containing min_area, median_area, max_area, and img_size_48.
+
+#     Returns:
+#     - Processed prediction mask.
+#     """
+#     structure = np.ones((10, 10, 10)) # Define the structuring element
+    
+#     # Combine masks using majority voting
+#     pred_192 = combine_masks_majority_voting(pred_list)
+    
+#     # Adjust min_area based on the number of connected components
+#     labeled_mask, num_features = ndimage.label(pred_192)
+#     min_area = param_3d.median_area if num_features > 1 else param_3d.min_area
+    
+#     # Find large components
+#     pred_192 = find_large_components(pred_192, min_area=min_area, max_area=param_3d.max_area)
+    
+#     # Apply morphological closing to fill concave regions and close bindings
+#     pred_192 = ndimage.binary_closing(pred_192, structure=structure).astype(int)
+    
+#     # Fill small and big holes
+#     pred_192 = ndimage.binary_fill_holes(pred_192).astype(int)
+    
+#     return pred_192
+    
+
+# Example usage:
+# Assuming pred_list and param_3d are already defined
+# processed_pred = process_predictions(pred_list, param_3d)
+
+
+# def process_pred_list(pred_list):
+#     # Normalize each mask and sum them
+#     pred_192 = sum(pred.astype(float) / np.sum(pred) for pred in pred_list)
+    
+#     # Apply thresholding    
+#     if count_connected_components(pred_192) >1 : 
+#         pred_192 = sum(pred.astype(float) / np.sum(pred) for pred in pred_list)
+#         pred_192 = pred_192 > np.max(pred_192) / 20
+#     elif count_connected_components(pred_192)==0:
+#         pred_192= find_largest_component(combine_masks_majority_voting(pred_list))
+#         return pred_192
+#     pred_192 = pred_192 > np.max(pred_192) / 50
+#     # Remove outliers if single connected component
+#     if count_connected_components(pred_192) == 1:
+#         pred_192 = remove_outside_outliers(pred_192, iterations=1)
+#         # pred_192 = compare_masks_and_clip(pred_192, pred_192)
+#         pred_192 = remove_outside_outliers(pred_192, iterations=1)
+#     return pred_192
+    
 
 def gen_fragments(input_volume, patch_size,y):
     fragments = []
@@ -637,6 +1425,181 @@ def draw_shapes(
     v = tf.math.ceil(v * (num_label - 1))
 
     return tf.cast(v, dtype) if v.dtype != dtype else v
+
+import scipy.spatial.transform as spt
+def bresenham_3d(start, end):
+    """
+    A basic implementation of Bresenham's line algorithm in 3D.
+    Computes the points on a 3D line between two points.
+    """
+    points = []
+
+    start = tf.cast(start, tf.int32)
+    end = tf.cast(end, tf.int32)
+
+    dx = abs(end[0] - start[0])
+    dy = abs(end[1] - start[1])
+    dz = abs(end[2] - start[2])
+
+    x, y, z = start[0], start[1], start[2]
+    x_inc = 1 if end[0] > start[0] else -1
+    y_inc = 1 if end[1] > start[1] else -1
+    z_inc = 1 if end[2] > start[2] else -1
+
+    dx2 = dx * 2
+    dy2 = dy * 2
+    dz2 = dz * 2
+
+    if dx >= dy and dx >= dz:  # X dominant
+        err1 = dy2 - dx
+        err2 = dz2 - dx
+        for _ in range(dx):
+            points.append([x, y, z])
+            if err1 > 0:
+                y += y_inc
+                err1 -= dx2
+            if err2 > 0:
+                z += z_inc
+                err2 -= dx2
+            err1 += dy2
+            err2 += dz2
+            x += x_inc
+    elif dy >= dx and dy >= dz:  # Y dominant
+        err1 = dx2 - dy
+        err2 = dz2 - dy
+        for _ in range(dy):
+            points.append([x, y, z])
+            if err1 > 0:
+                x += x_inc
+                err1 -= dy2
+            if err2 > 0:
+                z += z_inc
+                err2 -= dy2
+            err1 += dx2
+            err2 += dz2
+            y += y_inc
+    else:  # Z dominant
+        err1 = dx2 - dz
+        err2 = dy2 - dz
+        for _ in range(dz):
+            points.append([x, y, z])
+            if err1 > 0:
+                x += x_inc
+                err1 -= dz2
+            if err2 > 0:
+                y += y_inc
+                err2 -= dz2
+            err1 += dx2
+            err2 += dy2
+            z += z_inc
+
+    points.append([x, y, z])
+    return tf.convert_to_tensor(points, dtype=tf.int32)
+import tensorflow as tf
+
+import tensorflow as tf
+def rotate_point(point, angles):
+    """ Rotate a point around the origin using specified angles (in degrees). """
+    angles = np.radians(angles)
+    rx = spt.Rotation.from_euler('x', angles[0]).as_matrix()
+    ry = spt.Rotation.from_euler('y', angles[1]).as_matrix()
+    rz = spt.Rotation.from_euler('z', angles[2]).as_matrix()
+    rotation_matrix = rz @ ry @ rx
+    return np.dot(rotation_matrix, point)
+
+def draw_sphere(volume, center, radius, label):
+    """ Draws a sphere in the volume at a given center with a given radius and label. """
+    x, y, z = tf.meshgrid(
+        tf.range(volume.shape[0], dtype=tf.float32),
+        tf.range(volume.shape[1], dtype=tf.float32),
+        tf.range(volume.shape[2], dtype=tf.float32),
+        indexing='ij'
+    )
+    center = tf.cast(center, tf.float32)
+    radius = tf.cast(radius, tf.float32)
+    distance = tf.sqrt((x - center[0])**2 + (y - center[1])**2 + (z - center[2])**2)
+    mask = distance <= radius
+    volume = tf.where(mask, tf.cast(label, volume.dtype), volume)
+    return volume
+    
+def draw_bones_only(
+    shape,
+    num_labels=16,
+    num_bones=50,
+    bone_length_range=(10, 80),
+    bone_radius_range=(2, 6),
+    label_min=8,
+    label_max=16,
+    fwhm_min=32,
+    fwhm_max=128,
+    dtype=None,
+    seed=None,
+    max_repeats=10,  # Maximum number of repetitions for each bone
+    shift_range=50,   # Maximum shift range to reduce overlap
+    **kwargs,
+):
+    # Seed for reproducibility
+    if seed is not None:
+        tf.random.set_seed(seed)
+    type_f = tf.float32
+    type_i = tf.int32
+    dtype = tf.dtypes.as_dtype(dtype or tf.keras.mixed_precision.global_policy().compute_dtype)
+
+    # Generate Perlin noise with two channels and normalize
+    out = ne.utils.augment.draw_perlin_full(
+        shape=(*shape, 2),
+        fwhm_min=fwhm_min,
+        fwhm_max=fwhm_max,
+        isotropic=False,
+        batched=False,
+        featured=True,
+        seed=seed,
+        dtype=type_f,
+        reduce=tf.math.reduce_max,
+    )
+    out = ne.utils.minmax_norm(out)
+    out = out[..., 0]  # Remove the extra channel if not needed
+
+    num_label = tf.random.uniform(shape=(), minval=label_min, maxval=label_max + 1, dtype=type_i)
+    out *= tf.cast(num_label, type_f)
+    out = tf.cast(out, type_i)
+
+    # Function to draw a 3D line (stick/bone) with a given radius
+    def draw_bone(volume, start, end, radius, label):
+        # Bresenham's line algorithm in 3D
+        points = bresenham_3d(start, end)
+        for point in points:
+            volume = draw_sphere(volume, point, radius, label)
+        return volume
+
+    # Generate bones
+    for _ in range(num_bones):
+        start = tf.stack([
+            tf.random.uniform(shape=(), minval=0, maxval=shape[0], dtype=type_i),
+            tf.random.uniform(shape=(), minval=0, maxval=shape[1], dtype=type_i),
+            tf.random.uniform(shape=(), minval=0, maxval=shape[2], dtype=type_i)
+        ])
+        length = tf.random.uniform(shape=(), minval=bone_length_range[0], maxval=bone_length_range[1], dtype=type_i)
+        direction = tf.random.normal(shape=[3])
+        direction = direction / tf.norm(direction)  # Normalize to create a unit vector
+        end = start + tf.cast(direction * tf.cast(length, direction.dtype), type_i)
+        end = tf.clip_by_value(end, clip_value_min=0, clip_value_max=tf.constant(shape) - 1)
+        radius = tf.random.uniform(shape=(), minval=bone_radius_range[0], maxval=bone_radius_range[1], dtype=type_i)
+        label = tf.random.uniform(shape=(), minval=1, maxval=num_labels + 1, dtype=type_i)  # Random label
+
+        # Number of repetitions for this bone
+        num_repeats = tf.random.uniform(shape=(), minval=0, maxval=max_repeats + 1, dtype=type_i)
+        
+        # Draw the original bone and its repetitions
+        for _ in range(num_repeats):
+            # Apply a random shift to avoid overlap
+            shift = tf.random.uniform(shape=[3], minval=-shift_range, maxval=shift_range, dtype=type_i)
+            start_shifted = tf.clip_by_value(start + shift, clip_value_min=0, clip_value_max=tf.constant(shape) - 1)
+            end_shifted = tf.clip_by_value(end + shift, clip_value_min=0, clip_value_max=tf.constant(shape) - 1)
+            
+            out = draw_bone(out, start_shifted, end_shifted, radius, label)
+
+    return tf.cast(out, dtype) if out.dtype != dtype else out
     
 def dynamic_resize(image, target_width=192):   
 
@@ -648,29 +1611,170 @@ def dynamic_resize(image, target_width=192):
     return new_voxsize
 
 
-class PeriodicWeightsSaver(tf.keras.callbacks.Callback):
-    def __init__(self, filepath, save_freq=200, **kwargs):
+from tensorflow.keras.callbacks import Callback
+
+class PeriodicWeightsSaver(Callback):
+    def __init__(self, filepath, latest_epoch=0, save_freq=200, **kwargs):
         super().__init__(**kwargs)
         self.filepath = filepath
         self.save_freq = save_freq
+        self.latest_epoch = latest_epoch  # Track the latest saved epoch
 
     def on_epoch_end(self, epoch, logs=None):
         # Save the weights every `save_freq` epochs
         if (epoch + 1) % self.save_freq == 0:
             weights_path = os.path.join(self.filepath, f"weights_epoch_{epoch + 1}.h5")
             self.model.save_weights(weights_path)
+            self.latest_epoch = epoch + 1  # Update the latest saved epoch
             print(f"Saved weights to {weights_path}")
+
+    def get_latest_epoch(self):
+        return self.latest_epoch
+
+
+# class PeriodicWeightsSaver(tf.keras.callbacks.Callback):
+#     def __init__(self, filepath, save_freq=200, **kwargs):
+#         super().__init__(**kwargs)
+#         self.filepath = filepath
+#         self.save_freq = save_freq
+
+#     def on_epoch_end(self, epoch, logs=None):
+#         # Save the weights every `save_freq` epochs
+#         if (epoch + 1) % self.save_freq == 0:
+#             weights_path = os.path.join(self.filepath, f"weights_epoch_{epoch + 1}.h5")
+#             self.model.save_weights(weights_path)
+#             print(f"Saved weights to {weights_path}")
+
+from tensorflow.keras.callbacks import Callback
+
+class CustomTensorBoard(Callback):
+    def __init__(self, base_log_dir, models_dir, **kwargs):
+        super(CustomTensorBoard, self).__init__()
+        self.base_log_dir = base_log_dir
+        self.train_log_dir = os.path.join(base_log_dir, 'train')
+        self.models_dir = models_dir
+        self.latest_epoch = 0
+        latest_weight = max(glob.glob(os.path.join(self.train_log_dir, 'events*.v2')), key=os.path.getctime, default=None)
+        if latest_weight is not None:
+            latest_epoch = int(latest_weight.split('.')[-2])
+            print("latest epoch is ",10+latest_epoch)
+            self.latest_epoch = 10+latest_epoch
     
-class CustomTensorBoard(tf.keras.callbacks.TensorBoard):
-    def __init__(self, base_log_dir, **kwargs):
-         super(CustomTensorBoard, self).__init__(**kwargs)
-         self.base_log_dir = base_log_dir
 
-    def on_epoch_begin(self, epoch, logs=None):
-        # if epoch % self.histogram_freq == 0:  # Check if it's the start of a new set of 50 epochs
-        self.log_dir = self.base_log_dir
-        super().set_model(self.model)
+    def set_model(self, model):
+        self.model = model
 
+    def on_train_begin(self, logs=None):
+        # Ensure the log directory exists
+        os.makedirs(self.train_log_dir, exist_ok=True)
+        
+        # Load weights from the latest checkpoint to continue training
+        latest_checkpoint = tf.train.latest_checkpoint(self.train_log_dir)
+        if latest_checkpoint:
+            print(f"Resuming training from checkpoint: {latest_checkpoint}")
+            # Extract the epoch number from the checkpoint file name
+            # self.latest_epoch = int(latest_checkpoint.split('-')[-1].split('.')[0])
+            print(f"Resuming from epoch {self.latest_epoch}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        # Log metrics for TensorBoard
+        with tf.summary.create_file_writer(self.train_log_dir, filename_suffix=".v2").as_default():
+            for metric_name, value in logs.items():
+                tf.summary.scalar(metric_name, value, step=self.latest_epoch+epoch)
+        
+        print(f"Logged metrics for epoch {epoch}")
+        
+# class CustomTensorBoard(tf.keras.callbacks.TensorBoard):
+#     def __init__(self, base_log_dir, **kwargs):
+#          super(CustomTensorBoard, self).__init__(**kwargs)
+#          self.base_log_dir = base_log_dir
+
+#     def on_epoch_begin(self, epoch, logs=None):
+#         # if epoch % self.histogram_freq == 0:  # Check if it's the start of a new set of 50 epochs
+#         self.log_dir = self.base_log_dir
+#         super().set_model(self.model)
+def generator_brain_with_eyes(label_maps):
+    rand = np.random.default_rng()
+    label_maps = np.asarray(label_maps)
+    
+    while True:
+        fg = rand.choice(label_maps)
+        fg = place_two_spheres(fg, min_radius=3, max_radius=4, min_distance=15, max_distance=20, label=32)
+
+        yield fg[None, ..., None]
+
+
+import numpy as np
+from scipy.ndimage import gaussian_filter
+
+def attach_shifted_component_np(fg, min_shift=20, max_shift=50, stretch_factor=1.5, smoothing_sigma=2):
+    shape = fg.shape
+    # Calculate maximum possible shift in each dimension
+    max_possible_shift = [s - min_shift for s in shape]
+    
+    # Randomly select shift values ensuring no overlap
+    shift = np.random.randint(min_shift, max_shift + 1, size=3)
+    
+    # Ensure shift does not exceed available space
+    shift = np.minimum(shift, max_possible_shift)
+    
+    # Create the shifted volume
+    shifted_volume = np.roll(fg, shift=shift, axis=(0, 1, 2))
+    
+    # Find the center of the shifted volume
+    center = np.array(shifted_volume.shape) // 2
+    
+    # Generate an ellipsoid mask
+    z, y, x = np.indices(shifted_volume.shape)
+    ellipsoid_mask = ((z - center[0]) ** 2 / (shape[0] // 4) ** 2 +
+                      (y - center[1]) ** 2 / (shape[1] // 4) ** 2 +
+                      (x - center[2]) ** 2 / (shape[2] // (4 * stretch_factor)) ** 2) <= 1
+    
+    # Smooth the ellipsoid mask to create softer boundaries
+    ellipsoid_mask = gaussian_filter(ellipsoid_mask.astype(float), sigma=smoothing_sigma)
+    
+    # Threshold the smoothed ellipsoid to create the new component
+    new_component = np.where(ellipsoid_mask > 0.5, 8, 0)
+    
+    # Combine original and new component, preserving the original non-zero values
+    combined_volume = np.where(new_component > 0, new_component, fg)
+    
+    return combined_volume
+
+
+# def attach_shifted_component_np(fg, min_shift=20, max_shift=50):
+#     shape = fg.shape
+#     # Calculate maximum possible shift in each dimension
+#     max_possible_shift = [s - min_shift for s in shape]
+    
+#     # Randomly select shift values ensuring no overlap
+#     shift = np.random.randint(min_shift, max_shift + 1, size=3)
+    
+#     # Ensure shift does not exceed available space
+#     shift = np.minimum(shift, max_possible_shift)
+    
+#     # Create the shifted volume
+#     shifted_volume = np.roll(fg, shift=shift, axis=(0, 1, 2))
+    
+#     # Create new component mask
+#     new_component = np.where(shifted_volume > 0, 8, 0)
+    
+#     # Combine original and new component
+#     combined_volume = np.where(new_component > 0, new_component, fg)
+    
+#     return combined_volume
+
+def generator_two_brain(label_maps):
+    rand = np.random.default_rng()
+    label_maps = np.asarray(label_maps)
+    
+    while True:
+        fg = rand.choice(label_maps)        
+        # Attach shifted component
+        fg = attach_shifted_component_np(fg)
+        
+        yield fg[None, ..., None]
+        
 def generator_brain(label_maps):
     rand = np.random.default_rng()
     label_maps = np.asarray(label_maps)
@@ -732,7 +1836,7 @@ def extract_centered_cube(input_volume, cube_size=32):
     return cube
 
 
-def linear_soft_dice(a, b, foreground_weight=0.8, background_weight=0.2):
+def linear_soft_dice(a, b, foreground_weight=0.3, background_weight=0.7):
     # Calculate Soft Dice for foreground
     foreground_dice = soft_dice(a * b, b)
     
@@ -776,7 +1880,7 @@ def dynamic_resize(image, target_width=192):
     new_voxsize = np.max(new_voxsize[:2])  # ignore slice thickness
     return new_voxsize
 
-def load_val(validation_folder_path):
+def load_val(validation_folder_path,input_id):
 
     latest_images=[]
     latest_masks=[]
@@ -793,9 +1897,12 @@ def load_val(validation_folder_path):
             mom = int(mom_str)
         else:
             mom=0
-        
+        if input_id !=mom:
+            continue
         folder_path = os.path.join(validation_folder_path, folder)
-        filename = os.path.join(folder_path,"image.nii.gz")
+        # filename = os.path.join(folder_path,"image.nii.gz")
+        filename = os.path.join(folder_path, "image.nii.gz") if os.path.exists(os.path.join(folder_path, "image.nii.gz")) else os.path.join(folder_path, "image.mgz")
+
         mask_filename = os.path.join(folder_path,"manual.nii.gz")
         image = sf.load_volume(filename)
         
@@ -824,6 +1931,45 @@ def load_val(validation_folder_path):
             
 
     return mom_ids, latest_images, latest_masks , b2_images, b3_images, b2_masks, b3_masks
+    
+def load_random_val(validation_folder_path, count = 10):
+
+    latest_images=[]
+    latest_masks=[]
+    b2_images=[]
+    b3_images=[]
+    b2_masks=[]
+    b3_masks=[]
+    mom_ids = []
+    subfolders = [f.name for f in os.scandir(validation_folder_path) if f.is_dir()]
+    i = 0 
+    for folder in subfolders:
+        i +=1
+
+        if "rest" in folder or i > count:
+            continue
+            
+        mom_str = folder.split("_")[1]
+        if mom_str.isdigit():
+            mom = int(mom_str)
+        else:
+            mom=0 
+        folder_path = os.path.join(validation_folder_path, folder)
+        filename = os.path.join(folder_path, "image.nii.gz") if os.path.exists(os.path.join(folder_path, "image.nii.gz")) else os.path.join(folder_path, "image.mgz")
+
+        image = sf.load_volume(filename).reshape([192,192,192,1])
+        new_voxsize = [dynamic_resize(image)]*3
+            
+        orig_voxsize = image.geom.voxsize
+        crop_img = image.resize([orig_voxsize[0],orig_voxsize[1],1], method="linear")
+        crop_img = crop_img.resize(new_voxsize, method="linear").reshape([192, 192, 192])
+        crop_data = crop_img.data
+        
+        latest_images.append(crop_img)
+        mom_ids.append(mom)
+            
+
+    return mom_ids, latest_images, latest_masks
 
 def find_largest_component(mask):
     labeled_mask, num_features = ndi.label(mask)
@@ -837,7 +1983,152 @@ def find_largest_component(mask):
 
     return largest_component if largest_component is not None else np.zeros_like(mask)
 
+def find_large_components(mask, min_area=10000, max_area=60000):
+    labeled_mask, num_features = ndi.label(mask)
+    large_components = np.zeros_like(mask)
 
+    for region in regionprops(labeled_mask):
+        if min_area <= region.area <= max_area:
+            large_components[labeled_mask == region.label] = 1
+
+    return large_components
+
+def count_connected_components(mask):
+    """
+    Counts the number of connected components in a binary mask.
+
+    Parameters:
+    mask (ndarray): Binary mask (2D array) where the connected components are to be counted.
+
+    Returns:
+    int: Number of connected components in the mask.
+    """
+    labeled_mask, num_features = label(mask, return_num=True)
+    return num_features
+    
+def find_smallest_component(mask):
+    labeled_mask, num_features = ndi.label(mask)
+    smallest_component = None
+    min_area = float('inf')  # Start with infinity to find the minimum
+
+    for region in regionprops(labeled_mask):
+        if region.area < min_area:
+            min_area = region.area
+            smallest_component = (labeled_mask == region.label)
+
+    return smallest_component if smallest_component is not None else np.zeros_like(mask)
+
+def fit_ellipsoid_to_largest_component(mask):
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        # Return default centroid as (32, 32, 32) and radii as 32 if no components are found
+        return np.array([32, 32, 32]), np.array([32, 32, 32]), np.eye(3)
+    
+    centroid = np.mean(coords, axis=0)
+    centered_coords = coords - centroid
+    u, s, vh = svd(centered_coords, full_matrices=False)
+    radii = np.max(np.abs(centered_coords @ vh.T), axis=0)
+    # print(centroid, radii, vh)
+    return centroid, radii, vh
+
+def calculate_std_of_weighted_mask(weighted_mask):
+    """
+    Calculate the standard deviation of values in a weighted 3D mask.
+
+    Args:
+        weighted_mask (np.ndarray): 3D weighted mask.
+
+    Returns:
+        float: Standard deviation of the values in the weighted mask.
+    """
+    flattened_mask = weighted_mask.flatten()
+    
+    # Filter out zero values
+    non_zero_values = flattened_mask[flattened_mask != 0]
+    
+    # Calculate the standard deviation of the non-zero values
+    std_dev = np.std(non_zero_values)
+    
+    return std_dev
+
+
+def apply_ellipsoid_filter(mask, centroid, radii, vh, scale_factor=1.0):
+    filtered_mask = np.zeros_like(mask)
+    coords = np.argwhere(mask)
+    
+    scaled_radii = radii * scale_factor
+    inv_radii = 1 / scaled_radii
+    inv_radii_matrix = np.diag(inv_radii)
+    
+    for coord in coords:
+        transformed_coord = (coord - centroid) @ vh.T @ inv_radii_matrix
+        if np.sum(transformed_coord**2) <= 1.0:
+            filtered_mask[tuple(coord)] = 1
+    
+    return filtered_mask
+
+def iterative_ellipsoid_filter(mask, min_fraction=0.96, step=0.05, max_iterations=100):
+    largest_component = find_largest_component(mask)
+    centroid, radii, vh = fit_ellipsoid_to_largest_component(largest_component)
+    
+    scale_factor = 1.0
+    previous_mask = largest_component
+    current_mask = apply_ellipsoid_filter(largest_component, centroid, radii, vh, scale_factor)
+    
+    iterations = 0
+    while np.sum(current_mask) >= min_fraction * np.sum(previous_mask) and iterations < max_iterations:
+        previous_mask = current_mask
+        scale_factor -= step
+        current_mask = apply_ellipsoid_filter(largest_component, centroid, radii, vh, scale_factor)
+        iterations += 1
+    
+    return previous_mask
+
+
+from scipy.ndimage import binary_dilation, binary_erosion
+def morphological_cleaning(mask, iterations=3):
+    """
+    Apply morphological cleaning to remove outliers.
+
+    Parameters:
+    - mask: Input binary 3D mask.
+    - iterations: Number of times to apply dilation and erosion.
+
+    Returns:
+    - Cleaned binary 3D mask.
+    """
+    structure = np.ones((3, 3, 3))  # Define the structure for morphological operations
+    cleaned_mask = mask.copy()
+
+    for _ in range(iterations):
+        cleaned_mask = binary_dilation(cleaned_mask, structure=structure)
+        cleaned_mask = iterative_ellipsoid_filter(cleaned_mask,min_fraction=0.95, step=0.04)
+        cleaned_mask = binary_erosion(cleaned_mask, structure=structure)
+    
+    return cleaned_mask
+
+def remove_outside_outliers(mask, iterations=2):
+    # Dilate the mask to capture neighboring voxels
+    
+    eroded_mask = morphological_cleaning(mask,iterations=iterations)
+    eroded_mask = find_large_components(eroded_mask,min_area=1000, max_area=60000)
+    # Mask out everything outside the original brain mask
+    cleaned_mask = mask.copy()
+    cleaned_mask[eroded_mask == 0] = 0
+    dilated_mask = binary_dilation(cleaned_mask, iterations=iterations)
+    
+    return cleaned_mask
+
+def compare_masks_and_clip(first_mask, second_mask):
+    # Create a mask of voxels that are within the boundaries of the first mask
+    valid_mask = (second_mask == 1) & (first_mask == 1)
+    
+    # Clip the second mask to only keep voxels within the boundaries of the first mask
+    clipped_mask = second_mask.copy()
+    clipped_mask[~valid_mask] = 0
+    
+    return clipped_mask
+    
 def dice_coefficient(y_true, y_pred):
     intersection = np.sum(y_true * y_pred)
     union = np.sum(y_true) + np.sum(y_pred)
@@ -857,34 +2148,73 @@ def calculate_hard_dice(image, model, mask):
     prediction = ndimage.binary_fill_holes(prediction).astype(int)
     return my_hard_dice(prediction.flatten(),mask.data.flatten())
 
-def is_centered_3d(prediction, margins=(8, 8, 8)):
-    # Sum projections along each axis
-    summed_projection_axis0 = np.sum(prediction, axis=(1, 2))
-    summed_projection_axis1 = np.sum(prediction, axis=(0, 2))
-    summed_projection_axis2 = np.sum(prediction, axis=(0, 1))
-    
-    # Get non-zero coordinates for each axis
-    non_zero_coords_axis0 = np.argwhere(summed_projection_axis0)
-    non_zero_coords_axis1 = np.argwhere(summed_projection_axis1)
-    non_zero_coords_axis2 = np.argwhere(summed_projection_axis2)
-    
-    # Get min and max coordinates for each axis
-    min_coords_axis0 = np.min(non_zero_coords_axis0, axis=0)
-    max_coords_axis0 = np.max(non_zero_coords_axis0, axis=0)
-    
-    min_coords_axis1 = np.min(non_zero_coords_axis1, axis=0)
-    max_coords_axis1 = np.max(non_zero_coords_axis1, axis=0)
-    
-    min_coords_axis2 = np.min(non_zero_coords_axis2, axis=0)
-    max_coords_axis2 = np.max(non_zero_coords_axis2, axis=0)
-    
-    # Check if non-zero elements have margins in all axes
-    axis0_centered = (min_coords_axis0 >= margins[0]) and (summed_projection_axis0.shape[0] - max_coords_axis0 - 1 >= margins[0])
-    axis1_centered = (min_coords_axis1 >= margins[1]) and (summed_projection_axis1.shape[0] - max_coords_axis1 - 1 >= margins[1])
-    axis2_centered = (min_coords_axis2 >= margins[2]) and (summed_projection_axis2.shape[0] - max_coords_axis2 - 1 >= margins[2])
-    
-    return axis0_centered and axis1_centered and axis2_centered
 
+def is_centered_3d(prediction, margins=(8, 8, 8)):
+    try:
+        # Sum projections along each axis
+        summed_projection_axis0 = np.sum(prediction, axis=(1, 2))
+        summed_projection_axis1 = np.sum(prediction, axis=(0, 2))
+        summed_projection_axis2 = np.sum(prediction, axis=(0, 1))
+        
+        # Get non-zero coordinates for each axis
+        non_zero_coords_axis0 = np.argwhere(summed_projection_axis0)
+        non_zero_coords_axis1 = np.argwhere(summed_projection_axis1)
+        non_zero_coords_axis2 = np.argwhere(summed_projection_axis2)
+        
+        # If any axis has no non-zero elements, return False
+        if not non_zero_coords_axis0.size or not non_zero_coords_axis1.size or not non_zero_coords_axis2.size:
+            return False
+        
+        # Get min and max coordinates for each axis
+        min_coords_axis0 = non_zero_coords_axis0.min()
+        max_coords_axis0 = non_zero_coords_axis0.max()
+        
+        min_coords_axis1 = non_zero_coords_axis1.min()
+        max_coords_axis1 = non_zero_coords_axis1.max()
+        
+        min_coords_axis2 = non_zero_coords_axis2.min()
+        max_coords_axis2 = non_zero_coords_axis2.max()
+        
+        # Check if non-zero elements have margins in all axes
+        axis0_centered = (min_coords_axis0 >= margins[0]) and ((prediction.shape[0] - max_coords_axis0 - 1) >= margins[0])
+        axis1_centered = (min_coords_axis1 >= margins[1]) and ((prediction.shape[1] - max_coords_axis1 - 1) >= margins[1])
+        axis2_centered = (min_coords_axis2 >= margins[2]) and ((prediction.shape[2] - max_coords_axis2 - 1) >= margins[2])
+        
+        return axis0_centered and axis1_centered and axis2_centered
+    except Exception as e:
+        return False
+
+def closest_margin_to_non_zero(mask):
+    # Get coordinates of non-zero elements
+    non_zero_coords = np.argwhere(mask)
+    
+    if non_zero_coords.size == 0:
+        # No non-zero elements, return infinity as distance
+        return float('inf'), float('inf'), float('inf')
+    
+    # Shape of the mask
+    mask_shape = np.array(mask.shape)
+    
+    # Calculate distances to boundaries
+    distances = []
+    for dim in range(3):  # Assuming 3D mask
+        min_distance = min(mask_shape[dim] - np.max(non_zero_coords[:, dim]), np.min(non_zero_coords[:, dim]))
+        distances.append(min_distance)
+    
+    # Return the minimum distances to each boundary
+    return distances[0], distances[1], distances[2]
+
+def check_non_zero_within_bounds(mask, valid_positions):
+    x1, y1, z1, x2, y2, z2 = valid_positions
+    # Get indices of non-zero elements within the specified bounds
+    non_zero_coords = np.argwhere(mask[x1:x2, y1:y2, z1:z2])
+    
+    # Check if there are any non-zero elements
+    if non_zero_coords.size > 0:
+        return 1
+    else:
+        return 0
+        
 def get_final_combined_mask(masks):
     """
     Return the final combined mask from a list of 3D masks.
@@ -898,7 +2228,7 @@ def get_final_combined_mask(masks):
     if not masks:
         raise ValueError("The list of masks is empty.")
 
-    final_mask = masks[-1]
+    final_mask = masks[-1] >= np.max(masks[-1])/2
     return final_mask.astype(int)
 
 def get_last_two_masks(masks):
@@ -929,10 +2259,207 @@ def get_first_combined_mask(masks):
     if not masks:
         raise ValueError("The list of masks is empty.")
 
-    final_mask = masks[0]
+    final_mask = masks[0] > np.max(masks[0])/2
     return final_mask.astype(int)
+
+def combine_masks_weighted_threshold(masks, method='max'):
+    """
+    Combine multiple 3D weighted masks and threshold based on the maximum or median value.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D weighted masks.
+    method (str): Method to determine the threshold ('max' or 'median').
+    
+    Returns:
+    np.ndarray: Combined and thresholded 3D mask.
+    """
+    # Sum the weighted masks
+    combined_mask = np.sum(masks, axis=0)
+    
+    # Determine the threshold
+    if method == 'max':
+        threshold = np.max(combined_mask) / 2
+    elif method == 'median':
+        threshold = np.median(combined_mask)
+    else:
+        raise ValueError("Invalid method. Use 'max' or 'median'.")
+    
+    # Apply the threshold
+    final_mask = combined_mask > threshold
+    
+    return final_mask.astype(int)
+
+import numpy as np
+from scipy.optimize import least_squares
+
+
+def fit_sphere_to_nonzero_elements(mask, max_radius=16):
+    """
+    Fit spheres to the non-zero elements in a 3D mask for each connected component 
+    and return a new mask containing these spheres.
+    
+    Args:
+    mask (np.ndarray): 3D binary mask (0 or 1).
+    max_radius (float): Maximum allowed radius for the sphere.
+    
+    Returns:
+    np.ndarray: New mask with the fitted spheres.
+    """
+    from scipy.optimize import least_squares
+    from scipy.ndimage import label
+
+    # Label connected components in the mask
+    labeled_mask, num_features = label(mask)
+    
+    new_mask = np.zeros_like(mask, dtype=int)
+    
+    for component in range(1, num_features + 1):
+        # Get coordinates of the current component
+        component_coords = np.column_stack(np.nonzero(labeled_mask == component))
+        
+        if component_coords.size == 0:
+            continue
+        
+        # Function to compute the residuals (distance from sphere surface)
+        def residuals(params, x, y, z):
+            xc, yc, zc, r = params
+            return np.sqrt((x - xc)**2 + (y - yc)**2 + (z - zc)**2) - r
+        
+        # Initial guess for the sphere parameters
+        x0, y0, z0 = np.mean(component_coords, axis=0)
+        r0 = np.mean(np.linalg.norm(component_coords - np.array([x0, y0, z0]), axis=1))
+        r0 = min(r0, max_radius)  # Ensure initial guess radius is within the max radius
+        initial_guess = [x0, y0, z0, r0]
+        
+        # Perform least squares optimization with constraint on radius
+        result = least_squares(residuals, initial_guess, args=(component_coords[:, 0], component_coords[:, 1], component_coords[:, 2]), bounds=([-np.inf, -np.inf, -np.inf, 0], [np.inf, np.inf, np.inf, max_radius]))
+        
+        # Extract the fitted sphere parameters
+        xc, yc, zc, r = result.x
+        
+        # Define a grid of coordinates
+        xx, yy, zz = np.indices(mask.shape)
+        
+        # Calculate the distance from the center for each point in the grid
+        distances = np.sqrt((xx - xc)**2 + (yy - yc)**2 + (zz - zc)**2)
+        
+        # Set points within the radius to 1
+        new_mask[distances <= r] = 1
+    
+    return new_mask
     
 
+
+def create_ellipsoid_around(brain_volume, margin=2, stretch_factors=(1.0, 5.0, 1.5)):
+    """
+    Create an ellipsoid around the brain volume.
+
+    Args:
+        brain_volume (tf.Tensor): 3D tensor of the brain volume.
+        margin (int): Additional margin to add around the brain bounding box.
+        stretch_factors (tuple): Factors to stretch the ellipsoid along each axis (z, y, x).
+
+    Returns:
+        tf.Tensor: 3D tensor of the ellipsoid mask.
+    """
+    # Find the bounding box of the brain
+    non_zero_indices = tf.where(brain_volume > 0)
+    min_z, max_z = tf.reduce_min(non_zero_indices[:, 0]), tf.reduce_max(non_zero_indices[:, 0])
+    min_y, max_y = tf.reduce_min(non_zero_indices[:, 1]), tf.reduce_max(non_zero_indices[:, 1])
+    min_x, max_x = tf.reduce_min(non_zero_indices[:, 2]), tf.reduce_max(non_zero_indices[:, 2])
+
+    # Calculate the center and radii of the ellipsoid
+    center = tf.cast([(max_z + min_z) / 2, (max_y + min_y) / 2, (max_x + min_x) / 2], tf.float32)
+    radii = tf.cast([(max_z - min_z) / 2, (max_y - min_y) / 2, (max_x - min_x) / 2], tf.float32) + margin
+
+    # Apply the stretch factors to the radii
+    radii = radii * tf.constant(stretch_factors, dtype=tf.float32)
+
+    # Create a grid of coordinates
+    z = tf.range(brain_volume.shape[0], dtype=tf.float32)
+    y = tf.range(brain_volume.shape[1], dtype=tf.float32)
+    x = tf.range(brain_volume.shape[2], dtype=tf.float32)
+    
+    z_grid, y_grid, x_grid = tf.meshgrid(z, y, x, indexing='ij')
+
+    # Calculate the ellipsoid formula
+    ellipsoid = ((x_grid - center[2]) ** 2 / radii[2] ** 2 +
+                 (y_grid - center[1]) ** 2 / radii[1] ** 2 +
+                 (z_grid - center[0]) ** 2 / radii[0] ** 2) <= 1
+
+    return tf.cast(ellipsoid, tf.uint8)
+    
+    
+def combine_masks_weighted_threshold_quartile(masks):
+    """
+    Combine multiple 3D weighted masks and threshold based on the fourth quartile (75th percentile) of non-zero weights.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D weighted masks.
+    
+    Returns:
+    np.ndarray: Combined and thresholded 3D mask.
+    """
+    # Combine masks and flatten to work with non-zero values
+    combined_mask = np.sum(masks, axis=0).flatten()
+    
+    # Remove zero values
+    combined_mask_nonzero = combined_mask[combined_mask > 0]
+    
+    # Determine the threshold as the 75th percentile of non-zero values
+    threshold = np.percentile(combined_mask_nonzero, 75)
+    
+    # Apply the threshold to create the final mask
+    final_mask = np.sum(masks, axis=0) > threshold
+    
+    return final_mask.astype(int)
+
+def combine_masks_median_threshold_median(masks):
+    """
+    Combine multiple 3D weighted masks and threshold based on the median of non-zero weights.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D weighted masks.
+    
+    Returns:
+    np.ndarray: Combined and thresholded 3D mask.
+    """
+    # Combine masks and flatten to work with non-zero values
+    combined_mask = np.sum(masks, axis=0).flatten()
+    
+    # Remove zero values
+    combined_mask_nonzero = combined_mask[combined_mask > 0]
+    
+    # Determine the threshold as the median of non-zero values
+    threshold = np.median(combined_mask_nonzero)
+    
+    # Apply the threshold to create the final mask
+    final_mask = np.sum(masks, axis=0) > threshold
+    
+    return final_mask.astype(int)
+
+
+def combine_masks_max_threshold_median(masks):
+    """
+    Combine multiple 3D weighted masks and threshold based on the median of non-zero weights.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D weighted masks.
+    
+    Returns:
+    np.ndarray: Combined and thresholded 3D mask.
+    """
+    # Combine masks and flatten to work with non-zero values
+    combined_mask = np.sum(masks, axis=0).flatten()
+    
+    # Determine the threshold as the median of non-zero values
+    threshold = np.max(combined_mask)
+    
+    # Apply the threshold to create the final mask
+    final_mask = np.sum(masks, axis=0) >= threshold
+    
+    return final_mask.astype(int)
+    
 def combine_masks_weighted_average_descending(masks, weights):
     """
     Combine multiple 3D masks using weighted averaging with descending weights.
@@ -967,6 +2494,27 @@ def combine_masks_weighted_average_ascending(masks, weights):
     return (combined_mask > 0.5).astype(int)
 
 
+def is_centered_in_plane(prediction, margins=(8, 8, 8, 8)):
+    summed_projection_axis2 = np.sum(prediction, axis=2)
+    
+    summed_projection_axis0 = np.sum(summed_projection_axis2, axis=0)
+    summed_projection_axis1 = np.sum(summed_projection_axis2, axis=1)
+    
+    non_zero_coords_axis0 = np.argwhere(summed_projection_axis0)
+    non_zero_coords_axis1 = np.argwhere(summed_projection_axis1)
+    
+    min_coords_axis0 = np.min(non_zero_coords_axis0, axis=0)
+    max_coords_axis0 = np.max(non_zero_coords_axis0, axis=0)
+    
+    min_coords_axis1 = np.min(non_zero_coords_axis1, axis=0)
+    max_coords_axis1 = np.max(non_zero_coords_axis1, axis=0)
+    
+    axis0_centered = np.all(min_coords_axis0 >= margins[0]) and np.all(summed_projection_axis0.shape - max_coords_axis0 - 1 >= margins[1])
+    axis1_centered = np.all(min_coords_axis1 >= margins[2]) and np.all(summed_projection_axis1.shape - max_coords_axis1 - 1 >= margins[3])
+    
+    return axis0_centered and axis1_centered
+
+
 def combine_masks_intersection(masks):
     """
     Combine multiple 3D masks using intersection.
@@ -993,6 +2541,98 @@ def combine_masks_union(masks):
     combined_mask = np.logical_or.reduce(masks)
     return combined_mask.astype(int)
     
+def combine_masks_sum(masks):
+    """
+    Combine multiple 3D masks by summing their values.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+    
+    Returns:
+    np.ndarray: Combined 3D mask with summed values.
+    """
+    combined_mask = np.sum(masks, axis=0)
+    return combined_mask
+
+def combine_masks_top_75_percent(masks):
+    """
+    Combine multiple 3D masks and threshold to only allow the top 25% of unique values.
+    
+    Args:
+    masks (list of np.ndarray): List of 3D masks.
+    
+    Returns:
+    np.ndarray: Combined and thresholded 3D mask.
+    """
+    # Sum the masks
+    combined_mask = np.sum(masks, axis=0)
+    
+    # Get unique values and sort them
+    unique_values = np.unique(combined_mask)
+    
+    # Determine the threshold for the top 25% of unique values
+    threshold_index = int(0.25 * len(unique_values))
+    threshold_value = unique_values[threshold_index]
+    # Create the final mask based on the threshold
+    
+    final_mask = combined_mask >= threshold_value
+    # print(np.sum(final_mask))
+    return final_mask.astype(int)
+    
+import numpy as np
+
+from scipy.ndimage import label, find_objects
+
+def remove_small_components(mask, min_size=1000):
+    """
+    Remove connected components smaller than the specified size from a binary mask.
+    Ensures that no component of size >= min_size is removed.
+
+    Parameters:
+    - mask: 3D binary numpy array representing the mask.
+    - min_size: Minimum size of components to keep (e.g., 10000 voxels).
+
+    Returns:
+    - filtered_mask: 3D binary numpy array with small components removed.
+    """
+    # Label connected components
+    labeled_mask, num_features = label(mask)
+    
+    # Get the size of each connected component
+    component_sizes = [np.sum(labeled_mask == i) for i in range(1, num_features + 1)]
+    
+    # Find components smaller than min_size
+    small_components = [i + 1 for i, size in enumerate(component_sizes) if size < min_size]
+    
+    # Create a mask for keeping large components
+    large_components_mask = np.isin(labeled_mask, small_components, invert=True).astype(int)
+    
+    return large_components_mask
+
+
+def combine_masks_all_occurrences(pred_list):
+    """
+    Combine binary masks such that only voxels appearing in all masks are set to 1.
+
+    Parameters:
+    - pred_list: List of 3D binary numpy arrays representing the masks.
+
+    Returns:
+    - combined_mask: 3D binary numpy array where voxels that appear in all masks
+                      are set to 1, others are set to 0.
+    """
+    # Convert list of masks to a 4D numpy array (new axis for masks)
+    stacked_masks = np.stack(pred_list, axis=-1)
+    
+    # Find the number of masks
+    num_masks = len(pred_list)
+    
+    # Create combined mask where voxel is 1 if it appears in all masks
+    combined_mask = np.all(stacked_masks == 1, axis=-1).astype(int)
+    
+    return combined_mask
+
+
 def combine_masks_majority_voting(masks):
     """
     Combine multiple 3D masks using majority voting.
@@ -1003,6 +2643,710 @@ def combine_masks_majority_voting(masks):
     Returns:
     np.ndarray: Combined 3D mask.
     """
-    masks_stack = np.stack(masks, axis=-1)
+    # Set any mask with a sum less than 1000 to all 1s
+    processed_masks = []
+    for mask in masks:
+        if np.sum(mask) < 1000:
+            mask = np.ones_like(mask)
+        processed_masks.append(mask)
+
+    # Stack the processed masks along a new axis
+    masks_stack = np.stack(processed_masks, axis=-1)
+    
+    # Apply majority voting
     combined_mask = np.sum(masks_stack, axis=-1) > (len(masks) / 2)
+    
     return combined_mask.astype(int)
+
+    
+def calculate_weights(masks):
+    """
+    Calculate the weights for each mask based on the number of connected components.
+
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+
+    Returns:
+    np.ndarray: Weights for each mask.
+    """
+    weights = []
+    for mask in masks:
+        weight = 1.0
+        for i in range(mask.shape[0]):
+            if count_connected_components(mask[i]) > 1:
+                weight *= 0.5
+        weights.append(weight)
+    return np.array(weights)
+
+def combine_masks_weighted_majority_voting(masks):
+    """
+    Combine multiple 3D masks using weighted majority voting.
+
+    Args:
+    masks (list of np.ndarray): List of 3D binary masks (0 or 1).
+
+    Returns:
+    np.ndarray: Combined 3D mask.
+    """
+    weights = calculate_weights(masks)
+    masks_stack = np.stack(masks, axis=-1)
+    
+    # Apply weights to masks
+    weighted_masks_stack = masks_stack * weights.reshape(1, 1, 1, -1)
+    
+    # Sum along the new axis and apply majority voting
+    combined_mask = np.sum(weighted_masks_stack, axis=-1) > (np.sum(weights) / 2)
+    return combined_mask.astype(int)
+    
+    
+def first_stage_prediction(img, mask, mom, positions_48):
+    min_size , max_size = get_min_max_size(1,mom)
+    detection = False
+    combined_model_48 = get_model(models[3]) 
+
+    for min_size in tqdm(range(min_size, 15000, -4000)):
+        detection, valid_position_index_192, cube_48, mask_48, first_pred_192 = find_brain_48(positions_48, min_size, max_size, combined_model_48, img, mask)
+        if detection:
+            break
+
+    return detection, valid_position_index_192, cube_48, mask_48, first_pred_192
+
+def second_stage_prediction(img, mask, cube_48, mask_48, valid_position_index_192, mom, positions_24):
+    detection = False
+    combined_model_24 = get_model(models[2]) 
+    min_size , max_size = get_min_max_size(2,mom)
+    for min_size in tqdm(range(min_size, 1000, -4000)):
+        detection, pred_48, valid_position_index_48, cube_24, mask_24, second_pred_192 = find_brain_24(positions_24, min_size, max_size, combined_model_24, 
+                                                                                                       cube_48, mask_48, valid_position_index_192, img, mask)
+        if detection:
+            break
+    if not detection:
+        raise ValueError("No mask found in this stage!")
+    return detection, pred_48, valid_position_index_48, cube_24, mask_24, second_pred_192
+
+def third_stage_prediction(img, mask, cube_24, mask_24, cube_48, mask_48, valid_position_index_192, valid_position_index_48, mom, positions_12):
+    detection = False
+    combined_model_12 = get_model(models[1]) 
+    min_size , max_size = get_min_max_size(3,mom)
+    pred_24 = np.zeros_like(mask_24)
+    print("min size",min_size)
+    for min_size in tqdm(range(min_size, 3000, -2000)):
+        detection, pred_24, valid_position_index_24, cube_12, mask_12, third_pred_192 = find_brain_12(positions_12, min_size, max_size, combined_model_12, 
+                                                                                                     cube_24, mask_24, cube_48, mask_48, img, mask, valid_position_index_192, valid_position_index_48)
+        if detection:
+            break
+    if not detection:
+        raise ValueError("No mask found in this stage!")
+    return detection, pred_24, valid_position_index_24, cube_12, mask_12, third_pred_192
+
+def fourth_stage_prediction(img, mask, cube_12, mask_12, cube_24, mask_24, cube_48, mask_48, valid_position_index_24, valid_position_index_48, valid_position_index_192, mom, positions_6):
+    detection = False
+    combined_model_6 = get_model(models[0]) 
+    min_size , max_size = get_min_max_size(4,mom)
+    
+    list_pred_192 = []
+
+    for min_size in tqdm(range(min_size, 5000, -2000)):
+        detection, pred_12, valid_position_index_12, cube_6, fourth_pred_192 = find_brain_6(positions_6, min_size, max_size, combined_model_6, 
+                                                                                            cube_12, mask_12, cube_24, mask_24, cube_48, mask_48, img, mask, 
+                                                                                            valid_position_index_24, valid_position_index_48, valid_position_index_192)
+        if detection:
+            break
+            
+    if not detection:
+        raise ValueError("No mask found in this stage!")
+    return detection, pred_12, valid_position_index_12, cube_6, fourth_pred_192
+
+
+def compute_weights(length):
+    """
+    Compute weights for the masks, where earlier masks have higher weights.
+    
+    Args:
+    length (int): Number of masks.
+    
+    Returns:
+    list of float: Weights for each mask.
+    """
+    weights = np.linspace(1, 0.5, length)
+    weights = weights / np.sum(weights)
+    return weights.tolist()
+
+def compute_logarithmic_weights(length):
+    """
+    Compute logarithmically decreasing weights for the masks, where earlier masks have higher weights.
+    
+    Args:
+    length (int): Number of masks.
+    
+    Returns:
+    list of float: Logarithmically decreasing weights for each mask.
+    """
+    if length <= 0:
+        raise ValueError("Length must be a positive integer.")
+    
+    weights = np.logspace(0, -1, length)
+    weights = weights / np.sum(weights)
+    return weights.tolist()
+
+
+
+def zero_out_margins(image, margin_size=20):
+    """
+    Sets the margins of a 3D image to zero.
+    
+    Args:
+    image (np.ndarray): Input 3D image.
+    margin_size (int): Size of the margin to zero out.
+    
+    Returns:
+    np.ndarray: Image with zeroed-out margins.
+    """
+    # Make a copy of the image to avoid modifying the original
+    new_image = np.copy(image)
+    
+    # Set the margins to zero
+    new_image[:margin_size, :, :] = 0
+    new_image[-margin_size:, :, :] = 0
+    new_image[:, :margin_size, :] = 0
+    new_image[:, -margin_size:, :] = 0
+    new_image[:, :, :margin_size] = 0
+    new_image[:, :, -margin_size:] = 0
+    
+    return new_image
+
+
+def zero_out_margins(image, margin_size=20):
+    """
+    Sets the margins of a 3D image to zero.
+    
+    Args:
+    image (np.ndarray): Input 3D image.
+    margin_size (int): Size of the margin to zero out.
+    
+    Returns:
+    np.ndarray: Image with zeroed-out margins.
+    """
+    # Make a copy of the image to avoid modifying the original
+    new_image = np.copy(image)
+    
+    # Set the margins to zero
+    new_image[:margin_size, :, :] = 0
+    new_image[-margin_size:, :, :] = 0
+    new_image[:, :margin_size, :] = 0
+    new_image[:, -margin_size:, :] = 0
+    new_image[:, :, :margin_size] = 0
+    new_image[:, :, -margin_size:] = 0
+    
+    return new_image
+
+def randomly_brighten_3d_image(image, max_brightness_level=0.2):
+    """
+    Randomly increase the brightness of a 3D image.
+
+    Args:
+        image (tf.Tensor): 3D image tensor.
+        max_brightness_level (float): Maximum level to increase the brightness.
+
+    Returns:
+        tf.Tensor: Brightened 3D image.
+    """
+    adjust = tf.random.uniform([]) > 0.5
+    
+    if adjust:
+        # Randomly choose to brighten or darken (50% chance for each)
+        brighten = tf.random.uniform([]) > 0.5
+
+        # Choose a random brightness adjustment level between 0 and max_brightness_level
+        brightness_level = tf.random.uniform([], minval=0, maxval=max_brightness_level)
+
+        if brighten:
+            # Increase the brightness
+            adjusted_image = image * (1 + brightness_level)
+        else:
+            # Decrease the brightness
+            adjusted_image = image * (1 - brightness_level)
+
+        # Ensure the adjusted image is within the original value range
+        adjusted_image = tf.clip_by_value(adjusted_image, tf.reduce_min(image), tf.reduce_max(image))
+    else:
+        # No change
+        adjusted_image = image
+
+    return adjusted_image
+    
+
+def add_noise_to_3d_image(image,  maxval=0.5, noise_type='gaussian'):
+    """
+    Add noise to a 3D image using TensorFlow.
+
+    Args:
+        image (tf.Tensor): 3D image tensor.
+        noise_type (str): Type of noise to add ('gaussian' or 'salt_and_pepper').
+
+    Returns:
+        tf.Tensor: Noisy 3D image.
+    """
+    if noise_type not in ['gaussian', 'salt_and_pepper']:
+        raise ValueError("Invalid noise type. Supported types are 'gaussian' and 'salt_and_pepper'.")
+    
+    # Choose a random noise level between 0 and the maximum value in the image
+    noise_level = tf.random.uniform([], minval=0, maxval=maxval)
+
+    noisy_image = tf.identity(image)
+
+    if noise_type == 'gaussian':
+        mean = 0.0
+        std = noise_level * tf.math.reduce_std(image)
+        gaussian_noise = tf.random.normal(shape=image.shape, mean=mean, stddev=std, dtype=image.dtype)
+        noisy_image += gaussian_noise
+    
+    elif noise_type == 'salt_and_pepper':
+        prob = noise_level
+        random_values = tf.random.uniform(shape=image.shape)
+        salt_pepper_noise = tf.where(random_values < prob / 2, tf.zeros_like(image), 
+                                     tf.where(random_values < prob, tf.ones_like(image) * tf.reduce_max(image), image))
+        noisy_image = salt_pepper_noise
+
+    # Ensure the noisy image is within the original value range
+    noisy_image = tf.clip_by_value(noisy_image, tf.reduce_min(image), tf.reduce_max(image))
+    
+    return noisy_image
+
+def add_bias_to_3d_image(image, max_num_patches = 35, max_patch_size = 80, bias_type='patch', bias_level=0.3):
+    """
+    Add bias to a 3D image using TensorFlow.
+
+    Args:
+        image (tf.Tensor): 5D image tensor with shape (batch_size, depth, height, width, channels).
+        bias_type (str): Type of bias to add ('uniform', 'gradient', 'sinusoidal', 'patch').
+        bias_level (float): Level of the bias for non-random types.
+
+    Returns:
+        tf.Tensor: 5D image with added bias.
+    """
+    if bias_type not in ['uniform', 'gradient', 'sinusoidal', 'patch']:
+        raise ValueError("Invalid bias type. Supported types are 'uniform', 'gradient', 'sinusoidal', and 'patch'.")
+    
+    # Remove batch and channel dimensions for bias calculation
+    input_shape = tf.shape(image)
+    image_3d = tf.squeeze(image, axis=[0, -1])  # Shape (depth, height, width)
+
+    # Choose a random bias level between 0 and the maximum value in the image
+    random_bias_level = tf.random.uniform([], minval=0, maxval=tf.reduce_max(image_3d) * bias_level)
+
+    biased_image_3d = tf.identity(image_3d)
+
+    if bias_type == 'uniform':
+        uniform_bias = random_bias_level
+        biased_image += uniform_bias
+    
+    elif bias_type == 'gradient':
+        gradient_bias = tf.linspace(0.0, random_bias_level, num=image.shape[0])
+        gradient_bias = tf.reshape(gradient_bias, [image.shape[0], 1, 1])
+        biased_image += gradient_bias
+
+    elif bias_type == 'patch':
+        # Define patch size and number of patches
+        min_dim = tf.minimum(tf.minimum(input_shape[1], input_shape[2]), input_shape[3])
+        max_patch_size = 80#tf.minimum(min_dim // 2, 64)
+        patch_size = tf.random.uniform([], minval=4, maxval=max_patch_size, dtype=tf.int32)
+        num_patches = tf.random.uniform([], minval=1, maxval=max_num_patches, dtype=tf.int32)
+
+        for _ in range(num_patches):
+            # Randomly choose patch location ensuring it fits within the image bounds
+            z_start = tf.random.uniform([], minval=0, maxval=input_shape[1] - patch_size, dtype=tf.int32)
+            y_start = tf.random.uniform([], minval=0, maxval=input_shape[2] - patch_size, dtype=tf.int32)
+            x_start = tf.random.uniform([], minval=0, maxval=input_shape[3] - patch_size, dtype=tf.int32)
+            
+            # Create Gaussian bias patch
+            zz, yy, xx = tf.meshgrid(
+                tf.range(tf.cast(patch_size, tf.float32), dtype=tf.float32),
+                tf.range(tf.cast(patch_size, tf.float32), dtype=tf.float32),
+                tf.range(tf.cast(patch_size, tf.float32), dtype=tf.float32),
+                indexing='ij'
+            )
+            zz -= tf.cast(patch_size, tf.float32) / 2
+            yy -= tf.cast(patch_size, tf.float32) / 2
+            xx -= tf.cast(patch_size, tf.float32) / 2
+            sigma = tf.cast(patch_size, tf.float32) / 4.0
+            gaussian_bias_patch = random_bias_level * tf.exp(-(tf.square(zz) + tf.square(yy) + tf.square(xx)) / (2.0 * tf.square(sigma)))
+            
+            # Add Gaussian bias patch to the image
+            patch_indices = tf.stack(tf.meshgrid(
+                tf.range(z_start, z_start + patch_size),
+                tf.range(y_start, y_start + patch_size),
+                tf.range(x_start, x_start + patch_size),
+                indexing='ij'
+            ), axis=-1)
+            patch_indices = tf.reshape(patch_indices, [-1, 3])
+            updates = tf.reshape(gaussian_bias_patch, [-1])
+            biased_image_3d = tf.tensor_scatter_nd_sub(biased_image_3d, patch_indices, updates)
+
+    # Ensure the biased image is within the original value range
+    biased_image_3d = tf.clip_by_value(biased_image_3d, tf.reduce_min(image_3d), tf.reduce_max(image_3d))
+
+    # Reshape back to the original 5D shape
+    biased_image = tf.reshape(biased_image_3d, input_shape[1:4])
+    biased_image = tf.expand_dims(tf.expand_dims(biased_image, axis=0), axis=-1)
+    
+    return biased_image
+    
+
+
+
+def create_and_shift_ellipsoid(fg, min_margin=-2, max_margin=2, min_shift=24, max_shift=32):
+    """
+    Create an ellipsoid around the brain with a random margin and shift it randomly in any direction.
+
+    Parameters:
+    fg (tf.Tensor): The foreground 3D tensor representing the brain.
+    min_margin (int): Minimum margin value.
+    max_margin (int): Maximum margin value.
+    min_shift (int): Minimum shift value.
+    max_shift (int): Maximum shift value.
+
+    Returns:
+    tf.Tensor: The created and shifted ellipsoid.
+    """
+    # Randomly choose a margin
+    margin = tf.random.uniform([], min_margin, max_margin, dtype=tf.int32)
+
+    # Find the bounding box of the brain
+    non_zero_indices = tf.where(fg > 0)
+    min_z, max_z = tf.reduce_min(non_zero_indices[:, 0]), tf.reduce_max(non_zero_indices[:, 0])
+    min_y, max_y = tf.reduce_min(non_zero_indices[:, 1]), tf.reduce_max(non_zero_indices[:, 1])
+    min_x, max_x = tf.reduce_min(non_zero_indices[:, 2]), tf.reduce_max(non_zero_indices[:, 2])
+
+    # Calculate the center and radii of the ellipsoid
+    center = tf.cast([(max_z + min_z) / 2, (max_y + min_y) / 2, (max_x + min_x) / 2], tf.float32)
+    radii = tf.cast([(max_z - min_z) / 2, (max_y - min_y) / 2, (max_x - min_x) / 2], tf.float32) + tf.cast(margin, tf.float32)
+
+    # Create a grid of coordinates
+    z = tf.range(fg.shape[0], dtype=tf.float32)
+    y = tf.range(fg.shape[1], dtype=tf.float32)
+    x = tf.range(fg.shape[2], dtype=tf.float32)
+    
+    z_grid, y_grid, x_grid = tf.meshgrid(z, y, x, indexing='ij')
+
+    # Calculate the ellipsoid formula
+    ellipsoid = ((x_grid - center[2]) ** 2 / radii[2] ** 2 +
+                 (y_grid - center[1]) ** 2 / radii[1] ** 2 +
+                 (z_grid - center[0]) ** 2 / radii[0] ** 2) <= 1
+
+    elips = tf.cast(ellipsoid, tf.uint8)
+    
+    # Randomly choose a shift value and direction
+    shift_value = tf.random.uniform([], min_shift, max_shift, dtype=tf.int32)
+    axis = np.random.choice([0, 1, 2])
+
+    # Shift the ellipsoid
+    shifted_elips = tf.roll(elips, shift=shift_value, axis=axis)
+
+    return tf.cast(shifted_elips, tf.int32)
+    
+def longest_non_zero_spread(image):
+    non_zero_indices = np.argwhere(image != 0)
+    return 0 if non_zero_indices.size == 0 else (non_zero_indices.max(axis=0) - non_zero_indices.min(axis=0) + 1).max()
+
+def shortest_non_zero_spread(image):
+    nz = np.argwhere(image != 0)
+    return 0 if nz.size == 0 else (nz.max(0) - nz.min(0) + 1).min()
+
+def SSIMMeasure(y_true, y_pred):
+        return tf.reduce_mean(tf.image.ssim(y_true, y_pred, 1.0))
+    
+def SSIMLoss(y_true, y_pred):
+    ssim = tf.image.ssim(y_true, y_pred, max_val=1.0)  # Example SSIM calculation
+    return -(ssim - 2.0)
+
+import tensorflow as tf
+from tensorflow.keras import backend as K
+
+def MSELoss(y_true, y_pred):
+    y_true_shape = K.shape(y_true)
+    y_pred_shape = K.shape(y_pred)
+    mse = tf.keras.losses.mean_squared_error(y_true, y_pred)
+    return -1+mse
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+def create_sphere_mask(shape, center, radius):
+    z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    z_center, y_center, x_center = center
+    sphere_mask = (x - x_center)**2 + (y - y_center)**2 + (z - z_center)**2 <= radius**2
+    return sphere_mask
+
+def find_nonzero_voxels(volume):
+    return np.argwhere(volume > 0)
+
+def calculate_bounding_box(non_zero_voxels):
+    min_coords = np.min(non_zero_voxels, axis=0)
+    max_coords = np.max(non_zero_voxels, axis=0)
+    return min_coords, max_coords
+
+def random_rotation():
+    r = R.random()
+    return r.as_matrix()
+
+def rotate_point(point, rotation_matrix):
+    return np.dot(rotation_matrix, point)
+
+def place_two_spheres(volume, min_radius=2, max_radius=5, min_distance=8, max_distance=12, label=8):
+    non_zero_voxels = find_nonzero_voxels(volume)
+    
+    if len(non_zero_voxels) < 2:
+        raise ValueError("Not enough non-zero elements to place spheres.")
+    
+    min_coords, max_coords = calculate_bounding_box(non_zero_voxels)
+
+    # Calculate the initial possible positions for the spheres
+    mid_x = (min_coords[2] + max_coords[2]) // 2
+    mid_y = (min_coords[1] + max_coords[1]) // 2
+    mid_z = (min_coords[0] + max_coords[0]) // 2
+    
+    # Randomly generate distance between spheres
+    distance = np.random.randint(min_distance, max_distance + 1)
+    
+    # Randomly decide the side for the spheres
+    direction = np.random.choice([-1, 1])
+    
+    center1 = np.array([mid_z, mid_y, mid_x - direction * distance / 2])
+    center2 = np.array([mid_z, mid_y, mid_x + direction * distance / 2])
+
+    # Randomly generate radii for the spheres
+    radius1 = np.random.randint(min_radius, max_radius + 1)
+    radius2 = np.random.randint(min_radius, max_radius + 1)
+
+    # Apply random rotation
+    rotation_matrix = random_rotation()
+    center1_rotated = rotate_point(center1 - np.array([mid_z, mid_y, mid_x]), rotation_matrix) + np.array([mid_z, mid_y, mid_x])
+    center2_rotated = rotate_point(center2 - np.array([mid_z, mid_y, mid_x]), rotation_matrix) + np.array([mid_z, mid_y, mid_x])
+
+    # Ensure the centers are within the bounds of the volume
+    center1_rotated = np.clip(center1_rotated, radius1, np.array(volume.shape) - radius1 - 1)
+    center2_rotated = np.clip(center2_rotated, radius2, np.array(volume.shape) - radius2 - 1)
+
+    # Place the spheres with random radii
+    sphere_mask1 = create_sphere_mask(volume.shape, center1_rotated, radius1)
+    sphere_mask2 = create_sphere_mask(volume.shape, center2_rotated, radius2)
+    
+    volume[sphere_mask1] = label
+    volume[sphere_mask2] = label
+    
+    return volume
+
+def randomly_darken_3d_image(image, max_darkness_level=0.9):
+    """
+    Randomly decrease the brightness of a 3D image.
+
+    Args:
+        image (tf.Tensor): 3D image tensor.
+        max_darkness_level (float): Maximum level to decrease the brightness.
+
+    Returns:
+        tf.Tensor: Darkened 3D image.
+    """
+    # Ensure the image values are between 0 and 1
+    image = tf.clip_by_value(image, 0.0, 1.0)
+    
+    # Print the min and max values of the original image for debugging
+
+    # Choose a random darkness level between 0 and max_darkness_level
+    darkness_level = tf.random.uniform([], minval=0, maxval=max_darkness_level)
+
+    # Decrease the brightness of the image
+    darkened_image = image * (1 - darkness_level)
+
+    # Print the min and max values of the darkened image for debugging
+
+    return darkened_image
+
+
+def attach_shifted_component(fg, shift_range=(5, 20)):
+    fg = fg[0,...,0]
+    fg = tf.cast(fg, tf.int32)
+    
+    # Randomly select shift values
+    shift = tf.random.uniform(shape=(3,), minval=shift_range[0], maxval=shift_range[1], dtype=tf.int32)
+    
+    # Create the shifted volume
+    shifted_volume = tf.roll(fg, shift=shift, axis=[0, 1, 2])
+    
+    # Label new component as 8
+    new_component = tf.where(shifted_volume > 0, 8, 0)
+    
+    # Combine original and new component
+    combined_volume = tf.where(new_component > 0, new_component, fg)
+    
+    return combined_volume[None,...,None]
+
+import tensorflow as tf
+import matplotlib.pyplot as plt
+def create_sphere(center, radius, shape):
+    z, y, x = tf.meshgrid(tf.range(shape[2], dtype=tf.float32),
+                          tf.range(shape[1], dtype=tf.float32),
+                          tf.range(shape[0], dtype=tf.float32),
+                          indexing='ij')
+    distance = tf.sqrt(tf.square(x - center[0]) + tf.square(y - center[1]) + tf.square(z - center[2]))
+    sphere_mask = distance <= radius
+    return sphere_mask
+
+def create_ellipsoid(center, radii, shape):
+    z, y, x = tf.meshgrid(tf.range(shape[2], dtype=tf.float32),
+                          tf.range(shape[1], dtype=tf.float32),
+                          tf.range(shape[0], dtype=tf.float32),
+                          indexing='ij')
+    ellipsoid_mask = (tf.square(x - center[0]) / tf.square(radii[0]) +
+                      tf.square(y - center[1]) / tf.square(radii[1]) +
+                      tf.square(z - center[2]) / tf.square(radii[2])) <= 1
+    return ellipsoid_mask
+
+def add_random_shape(volume, volume_shape, label_range):
+    center = tf.random.uniform(shape=(3,), minval=0, maxval=volume_shape[0], dtype=tf.int32).numpy()
+    shape_type = random.choice(['sphere', 'ellipsoid'])
+    if shape_type == 'sphere':
+        radius = random.randint(20, 50)
+        mask = create_sphere(center, float(radius), volume_shape)
+    elif shape_type == 'ellipsoid':
+        radii = [float(random.randint(20, 50)) for _ in range(3)]
+        mask = create_ellipsoid(center, radii, volume_shape)
+    else:
+        raise ValueError("Unsupported shape type")
+
+    label = random.randint(1, label_range)
+    volume = tf.where(mask, label, volume)
+    return volume
+
+def add_noise_and_smooth(volume, sigma=2):
+    volume_np = volume.numpy()  # Convert TensorFlow tensor to NumPy array
+    volume_np = gaussian_filter(volume_np, sigma=sigma)  # Apply Gaussian filter
+    volume_np = np.round(volume_np).astype(np.int32)  # Round and convert to int32
+    return tf.convert_to_tensor(volume_np, dtype=tf.int32)  # Convert back to TensorFlow tensor
+
+def draw_layer_elipses(shape=(192, 192, 192), num_labels=16, num_shapes=100, sigma=2):
+    volume = tf.zeros(shape, dtype=tf.int32)
+    for _ in range(num_shapes):
+        volume = add_random_shape(volume, shape, num_labels)
+    
+    volume = add_noise_and_smooth(volume, sigma=sigma)
+    return volume
+
+def show_slice(volume, slice_idx):
+    plt.imshow(volume[:, :, slice_idx].numpy(), cmap='jet')
+    plt.colorbar()
+    plt.title(f'Slice {slice_idx}')
+    plt.show()
+
+
+def closest_distance_to_boundary(volume, valid_position_index_192, prev_shape):
+    x1, y1, z1, x2, y2, z2 = valid_position_index_192
+    volume = extract_cube(volume, x1, y1, z1, x2, y2, z2, cube_size=prev_shape)
+    non_zero_indices = np.argwhere(volume > 0)
+    
+    if non_zero_indices.size == 0:
+        return float('inf')
+
+    # print("aaa")
+    # ne.plot.volume3D(volume, slice_nos=ms)
+    # print("bbb")
+    min_coords = non_zero_indices.min(axis=0)
+    max_coords = non_zero_indices.max(axis=0)
+    shape = np.array(volume.shape)
+    
+    return np.min(np.concatenate((min_coords, shape - max_coords - 1)))
+
+    
+def zoom_and_pad_binary_mask(mask, zoom_factor=0.8):
+    """
+    Zoom in on a binary mask and pad it back to its original shape.
+
+    Parameters:
+    - mask: 3D binary numpy array representing the mask.
+    - zoom_factor: Float representing the zoom level (e.g., 2.0 for 2x zoom).
+
+    Returns:
+    - padded_mask: 3D binary numpy array zoomed and padded back to original shape.
+    """
+    original_shape = mask.shape  # Store the original shape of the mask
+
+    # Zoom in on the mask using nearest-neighbor interpolation
+    zoomed_mask = scipy.ndimage.zoom(mask.astype(float), zoom_factor, order=0)
+    zoomed_mask = np.round(zoomed_mask).astype(int)  # Round to ensure binary values
+
+    # Calculate the cropping size based on the zoomed mask
+    zoomed_shape = zoomed_mask.shape
+    crop_size = [min(zs, os) for zs, os in zip(zoomed_shape, original_shape)]  # Ensure crop fits in the original mask
+
+    # Crop the zoomed mask to the original shape or smaller
+    start_zoomed = [(zs - cs) // 2 for zs, cs in zip(zoomed_shape, crop_size)]
+    end_zoomed = [sz + cs for sz, cs in zip(start_zoomed, crop_size)]
+    cropped_zoomed_mask = zoomed_mask[start_zoomed[0]:end_zoomed[0], 
+                                      start_zoomed[1]:end_zoomed[1], 
+                                      start_zoomed[2]:end_zoomed[2]]
+
+    # Create a zero-filled array of the original shape
+    padded_mask = np.zeros(original_shape, dtype=int)
+
+    # Calculate where to place the cropped zoomed mask in the padded mask (centered)
+    start_pad = [(os - cs) // 2 for os, cs in zip(original_shape, crop_size)]
+    end_pad = [sp + cs for sp, cs in zip(start_pad, crop_size)]
+
+    # Place the cropped zoomed mask into the padded mask
+    padded_mask[start_pad[0]:end_pad[0], start_pad[1]:end_pad[1], start_pad[2]:end_pad[2]] = cropped_zoomed_mask
+    
+    return padded_mask
+
+
+def crop_and_pad_to_original(volume, zoom_factor=0.8):
+    """
+    Crop the center of the 3D volume and pad it back to its original shape.
+
+    Parameters:
+    - volume: 3D numpy array representing the medical image.
+    - crop_size: Tuple indicating the size of the region to crop from the center.
+
+    Returns:
+    - padded_volume: 3D numpy array of the volume cropped and padded to original shape.
+    """
+    original_shape = volume.shape  # Store the original shape of the volume
+
+    # Zoom in on the volume
+    zoomed_volume = scipy.ndimage.zoom(volume, zoom_factor)
+
+    # Calculate the cropping size based on the zoomed volume
+    zoomed_shape = zoomed_volume.shape
+    crop_size = [min(zs, os) for zs, os in zip(zoomed_shape, original_shape)]  # Ensure crop fits in the original volume
+
+    # Crop the zoomed volume to the original shape or smaller
+    start_zoomed = [(zs - cs) // 2 for zs, cs in zip(zoomed_shape, crop_size)]
+    end_zoomed = [sz + cs for sz, cs in zip(start_zoomed, crop_size)]
+    cropped_zoomed_volume = zoomed_volume[start_zoomed[0]:end_zoomed[0], 
+                                          start_zoomed[1]:end_zoomed[1], 
+                                          start_zoomed[2]:end_zoomed[2]]
+
+    # Create a zero-filled array of the original shape
+    padded_volume = np.zeros(original_shape)
+
+    # Calculate where to place the cropped zoomed volume in the padded volume (centered)
+    start_pad = [(os - cs) // 2 for os, cs in zip(original_shape, crop_size)]
+    end_pad = [sp + cs for sp, cs in zip(start_pad, crop_size)]
+
+    # Place the cropped zoomed volume into the padded volume
+    padded_volume[start_pad[0]:end_pad[0], start_pad[1]:end_pad[1], start_pad[2]:end_pad[2]] = cropped_zoomed_volume
+    
+    return padded_volume
+    
+def consensus_based_combination(pred_list, weights, center_weight=1.0, boundary_weight=0.1):
+    def min_max_normalize(mask):
+        if mask.dtype == bool:
+            return mask.astype(float)  # Convert boolean to float without normalization
+        min_val, max_val = np.min(mask), np.max(mask)
+        return (mask - min_val) / (max_val - min_val) if max_val > min_val else mask
+        
+    
+    weight_mask = center_weighting_mask(pred_list[0].shape, center_weight, boundary_weight)
+    normalized_masks = [min_max_normalize(mask) for mask in pred_list]
+    combined = sum(mask * weight * weight_mask for mask, weight in zip(normalized_masks, weights))
+    consensus_mask = np.sum(np.array(normalized_masks) > 0, axis=0) >= 2
+    return np.where(consensus_mask, combined, 0)

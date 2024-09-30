@@ -257,3 +257,139 @@ def conv3d(x, W, stride, pad="SAME"):
 def max_pool3d(x, ksize, stride):
     return tf.nn.max_pool3d(x, ksize=[1, ksize, ksize, ksize, 1], strides=[1, stride, stride, stride, 1], padding="SAME")
 
+
+
+
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.initializers import orthogonal
+
+from tensorflow.keras import layers, models, Input
+from tensorflow.keras.initializers import orthogonal
+
+
+# # Define the 3D Convolution Layer
+# def ConvolutionLayer3D(x, filters, kernel, strides, padding, block_id, kernel_init=orthogonal()):
+#     prefix = f'block_{block_id}_'
+#     x = layers.Conv3D(filters, kernel_size=kernel, strides=strides, padding=padding,
+#                       kernel_initializer=kernel_init, name=prefix+'conv')(x)
+    
+#     x = layers.LeakyReLU(name=prefix+'lrelu')(x)
+#     x = layers.Dropout(0.2, name=prefix+'drop')(x)
+#     # x = layers.BatchNormalization(name=prefix+'conv_bn')(x)
+#     return x
+
+# # Define the 3D Deconvolution Layer
+# def DeconvolutionLayer3D(x, filters, kernel, strides, padding, block_id, kernel_init=orthogonal()):
+#     prefix = f'block_{block_id}_'
+#     x = layers.Conv3DTranspose(filters, kernel_size=kernel, strides=strides, padding=padding,
+#                                kernel_initializer=kernel_init, name=prefix+'de-conv')(x)
+#     x = layers.Conv3DTranspose(filters, kernel_size=kernel, strides=strides, padding=padding,
+#                                kernel_initializer=kernel_init, name=prefix+'de-conv')(x)
+#     x = layers.LeakyReLU(name=prefix+'lrelu')(x)
+#     x = layers.Dropout(0.2, name=prefix+'drop')(x)
+#     # x = layers.BatchNormalization(name=prefix+'conv_bn')(x)
+#     return x
+
+# # Define the Noise Model
+# def noiseModel(input_shape):
+#     inputs = layers.Input(shape=input_shape)
+#     # Encoder
+#     conv1 = ConvolutionLayer3D(inputs, 64, (3, 3, 3), strides=(2, 2, 2), padding='same', block_id=1)
+#     conv2 = ConvolutionLayer3D(conv1, 128, (3, 3, 3), strides=(2, 2, 2), padding='same', block_id=2)
+#     conv3 = ConvolutionLayer3D(conv2, 192, (3, 3, 3), strides=(2, 2, 2), padding='same', block_id=3)
+#     # Decoder
+#     deconv1 = DeconvolutionLayer3D(conv3, 128, (3, 3, 3), strides=(2, 2, 2), padding='same', block_id=4)
+#     deconv2 = DeconvolutionLayer3D(deconv1, 64, (3, 3, 3), strides=(2, 2, 2), padding='same', block_id=5)
+#     deconv3 = DeconvolutionLayer3D(deconv2, 1, (3, 3, 3), strides=(2, 2, 2), padding='same', block_id=6)
+#     noise_model = models.Model(inputs=inputs, outputs=deconv3)
+#     return noise_model
+
+# # Define the Noise Model
+# def noiseModel(input_shape):
+#     inputs = layers.Input(shape=input_shape)
+    
+#     en = [16, 16, 32, 32, 64, 64, 128,128, 192]
+#     de = [192, 128, 128, 64, 64, 32, 32, 16, 16, 1]
+    
+#     x = inputs
+#     # Encoder
+#     for i, filters in enumerate(en):
+#         x = ConvolutionLayer3D(x, filters, (3, 3, 3), strides=(2, 2, 2) if i < len(en)-1 else (1, 1, 1), padding='same', block_id=i+1)
+    
+#     # Decoder
+#     for i, filters in enumerate(de):
+#         x = DeconvolutionLayer3D(x, filters, (3, 3, 3), strides=(2, 2, 2) if i < len(de)-1 else (1, 1, 1), padding='same', block_id=len(en) + i + 1)
+    
+#     noise_model = models.Model(inputs=inputs, outputs=x)
+#     return noise_model
+
+def ConvolutionLayer3D(x, filters, kernel, strides, padding, block_id, layer_id, kernel_init=orthogonal()):
+    prefix = f'block_{block_id}_layer_{layer_id}_'
+    x = layers.Conv3D(filters, kernel_size=kernel, strides=strides, padding=padding,
+                      kernel_initializer=kernel_init, name=prefix+'conv')(x)
+    x = layers.LeakyReLU(name=prefix+'lrelu')(x)
+    x = layers.Dropout(0.2, name=prefix+'drop')(x)
+    x = layers.BatchNormalization(name=prefix+'conv_bn')(x)
+    return x
+
+def DeconvolutionLayer3D(x, filters, kernel, strides, padding, block_id, layer_id, kernel_init=orthogonal()):
+    prefix = f'block_{block_id}_layer_{layer_id}_'
+    x = layers.Conv3DTranspose(filters, kernel_size=kernel, strides=strides, padding=padding,
+                               kernel_initializer=kernel_init, name=prefix+'de-conv')(x)
+    x = layers.LeakyReLU(name=prefix+'lrelu')(x)
+    x = layers.Dropout(0.2, name=prefix+'drop')(x)
+    x = layers.BatchNormalization(name=prefix+'conv_bn')(x)
+    return x
+    
+import voxelmorph as vxm
+def OneShotModel(input_shape, final_activation='softmax'):
+    inputs = layers.Input(shape=input_shape)
+    
+    en = [16 ,16 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64]
+    de = [64 ,64 ,64 ,64, 64 ,64 ,64, 64, 64, 16 ,16 ,2]
+    
+
+    unet_model = vxm.networks.Unet(inshape=input_shape, nb_features=(en, de), batch_norm=False,
+               nb_conv_per_level=2,
+               final_activation_function=final_activation)
+
+    return unet_model
+    
+def noiseModel(input_shape, final_activation=None):
+    inputs = layers.Input(shape=input_shape)
+    
+    en = [16, 16, 32, 32, 64, 64, 128]
+    de = [128, 64, 64, 32, 32, 16, 16, 1]
+    
+    x = inputs
+
+    unet_model = vxm.networks.Unet(inshape=input_shape, nb_features=(en, de), batch_norm=False,
+               nb_conv_per_level=2,
+               final_activation_function=final_activation)
+
+    # # Encoder
+    # for i, filters in enumerate(en):
+    #     x = ConvolutionLayer3D(x, filters, (3, 3, 3), strides=(1, 1, 1), padding='same', block_id=i+1, layer_id=1)
+    #     x = ConvolutionLayer3D(x, filters, (3, 3, 3), strides=(1, 1, 1), padding='same', block_id=i+1, layer_id=2)
+    #     if i < len(en) - 1:
+    #         x = layers.MaxPooling3D(pool_size=(2, 2, 2), padding='same', name=f'block_{i+1}_pool')(x)
+    
+    # # Decoder
+    # for i, filters in enumerate(de):
+    #     if i < len(de) - 1:
+    #         x = layers.UpSampling3D(size=(2, 2, 2), name=f'block_{len(en)+i+1}_upsample')(x)
+    #     x = DeconvolutionLayer3D(x, filters, (3, 3, 3), strides=(1, 1, 1), padding='same', block_id=len(en) + i + 1, layer_id=1)
+    #     x = DeconvolutionLayer3D(x, filters, (3, 3, 3), strides=(1, 1, 1), padding='same', block_id=len(en) + i + 1, layer_id=2)
+    
+    # # Final output layer with optional activation
+    # x = layers.Conv3D(1, (1, 1, 1), padding='same', activation=final_activation, name='final_conv')(x)
+    # input_img = Input(shape=(param_3d.img_size_192,param_3d.img_size_192,param_3d.img_size_192,1))
+
+    # generated_img_norm = min_max_norm(generated_img)
+            
+    # segmentation = unet_model(generated_img_norm)
+
+    # noise_model = models.Model(inputs=inputs, outputs=x)
+    return unet_model

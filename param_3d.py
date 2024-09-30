@@ -13,6 +13,12 @@ img_size_6 = 32
 img_size_12 = 64
 img_size_24 = 96
 img_size_48 = 128
+img_size_192 = 192
+
+median_area = 20000
+min_area = 6000
+max_area = 100000
+
 neg_per_img = 35
 framedim=192
 
@@ -30,7 +36,7 @@ w_std = 0.1
 lr = 0.00001
 small_lr = 0.000001
 
-epoch_num = 4000
+epoch_num = 8000
 pos_batch_12net = 16
 neg_batch = 96
 mini_batch = 128
