@@ -79,12 +79,12 @@ We achieve higher Dice scores on clinical datasets, demonstrating the model's ro
 If you use this code or model in your research, please cite:
 
 ```
-@article{yourpaper2024,
-  title={Revisiting Sliding Window Approach: Cascade UNets for Fetus Brain Segmentation When No Training Data Is Available},
-  author={Your Name et al.},
-  journal={Your Journal},
+@article{dadashkarimi2024,
+  title={Search Wide, Focus Deep: Automated Fetal Brain Extraction With Sparse Training Data},
+  author={Javid Dadashkarimi, Valeria Pena Trujillo, Camilo Jaimes, Lilla Z¨ollei, Malte Hoffmann},
+  journal={arXiv},
   year={2024},
-  publisher={Your Publisher}
+  publisher={arXiv}
 }
 ```
 
