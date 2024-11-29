@@ -1,4 +1,4 @@
-# Deep Focused Sliding Windows for Fetus Brain Localization
+# SEARCH WIDE, FOCUS DEEP: AUTOMATED FETAL BRAIN EXTRACTION WITH SPARSE TRAINING DATA
 
 
 ```
