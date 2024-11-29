@@ -1,5 +1,7 @@
 # SEARCH WIDE, FOCUS DEEP: AUTOMATED FETAL BRAIN EXTRACTION WITH SPARSE TRAINING DATA
 
+![ezgif-6-fe4285352e](https://github.com/user-attachments/assets/7a1f32f7-c955-4a16-9dee-49ac0a1d1315)
+
 
 ```
 @article{dadashkarimi2024,
