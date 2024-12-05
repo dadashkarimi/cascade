@@ -5,7 +5,6 @@
 - **24Net**: Optimized for `96×96×96` window.
 - **48Net**: Optimized for `128×128×128` window.
 
-![ezgif-6-fe4285352e](https://github.com/user-attachments/assets/7a1f32f7-c955-4a16-9dee-49ac0a1d1315)
 ![bfsdfs](https://github.com/user-attachments/assets/ea5af7c3-2725-4523-b14e-e363ff955750)
 
 
